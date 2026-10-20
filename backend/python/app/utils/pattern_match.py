@@ -34,6 +34,7 @@ from app.modules.retrieval.selection_scope import (
     resolve_request_scopes,
     selection_app_ids,
 )
+from app.models.source_dates import SOURCE_TIMESTAMP_ORIGIN_FIELD, upload_times_undated
 from app.services.graph_db.common.record_visibility import is_searchable_record
 from app.services.graph_db.interface.graph_db_provider import (
     STRICT_SCOPE_FILTER_KEY,
@@ -1949,6 +1950,8 @@ def _record_in_time_range(
         except (ValueError, TypeError):
             return None
 
+    if record.get("source_timestamp_origin") == "upload" and upload_times_undated():
+        return False
     created = _ts("source_created_at")
     modified = _ts("source_updated_at")
     if "source_created_after_ms" in time_range:
@@ -2462,6 +2465,7 @@ def _graph_record_in_time_range(
     adapted = {
         "source_created_at": graph_record.get("sourceCreatedAtTimestamp"),
         "source_updated_at": graph_record.get("sourceLastModifiedTimestamp"),
+        "source_timestamp_origin": graph_record.get(SOURCE_TIMESTAMP_ORIGIN_FIELD),
     }
     return _record_in_time_range(adapted, time_range)
 

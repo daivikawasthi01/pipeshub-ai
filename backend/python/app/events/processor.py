@@ -33,6 +33,7 @@ from app.models.blocks import (
     Point,
 )
 from app.models.entities import Record, RecordType
+from app.models.source_dates import SOURCE_TIMESTAMP_ORIGIN_FIELD
 from app.modules.parsers import parse_pool
 from app.modules.parsers.code_parser import engine as code_parser_engine
 from app.modules.parsers.code_parser.routing import CodeFileRoute, plan_code_file
@@ -104,6 +105,7 @@ def convert_record_dict_to_record(record_dict: dict) -> Record:
         ),
         source_created_at=record_dict.get("sourceCreatedAtTimestamp"),
         source_updated_at=record_dict.get("sourceLastModifiedTimestamp"),
+        source_timestamp_origin=record_dict.get(SOURCE_TIMESTAMP_ORIGIN_FIELD),
         weburl=record_dict.get("webUrl"),
         mime_type=mime_type,
         external_revision_id=record_dict.get("externalRevisionId"),
