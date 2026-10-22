@@ -132,11 +132,6 @@ async def test_a_failed_member_read_keeps_the_stored_group_and_the_rest_sync(ws:
     assert {m.email for m in ws.records.user_groups["other@example.com"][1]} == {ALICE, BOB}
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="A group whose last member left is skipped instead of being saved as empty, so the people "
-    "who left keep the group's access in PipesHub.",
-)
 async def test_a_group_whose_members_all_left_is_emptied(ws: Harness) -> None:
     ws.directory.add_group("team@example.com", [ALICE])
     await ws.sync()

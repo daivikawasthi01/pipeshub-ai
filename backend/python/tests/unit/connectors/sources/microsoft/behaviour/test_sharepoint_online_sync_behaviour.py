@@ -565,10 +565,6 @@ class TestAzureAdGroups:
         assert db.deleted_groups == ["g-old"]
         assert group_link(checkpoints)["deltaLink"] == groups_delta_url("D2")
 
-    @pytest.mark.xfail(strict=True, reason=(
-        "When a changed group's member list can't be read, the group is saved with no members, so everyone in it "
-        "loses the access the group gives (msgraph_client.get_group_members returns [] on error; "
-        "sharepoint_online/connector.py:3513)"))
     async def test_a_failed_member_read_keeps_the_stored_members(self, connector, api, db, checkpoints) -> None:
         serve_groups_delta(api, {
             None: page([], delta_link=groups_delta_url("D1")),
@@ -701,9 +697,6 @@ class TestSiteGroups:
 
         assert db.user_groups[f"{SITE_ID}-31"] == ["raj@contoso.com"]
 
-    @pytest.mark.xfail(strict=True, reason=(
-        "When a SharePoint site group's members can't be read, the group is saved with no members, removing its "
-        "members' access (sharepoint_online/connector.py:3145-3194)"))
     async def test_a_failed_site_group_member_read_keeps_the_stored_members(self, connector, api, db) -> None:
         serve_site(api)
         api.on("GET", GROUPS_DELTA, page([], delta_link=groups_delta_url("D1")))
@@ -714,6 +707,19 @@ class TestSiteGroups:
 
         await connector._sync_user_groups()
 
+        assert db.user_groups[f"{SITE_ID}-7"] == ["ana@contoso.com"]
+
+    async def test_a_failed_site_group_listing_keeps_every_stored_group_of_the_site(self, connector, api, db) -> None:
+        serve_site(api)
+        api.on("GET", GROUPS_DELTA, page([], delta_link=groups_delta_url("D1")))
+        api.on("GET", "/v1.0/groups", page([]))
+        db.user_groups[f"{SITE_ID}-7"] = ["ana@contoso.com"]
+        db.user_groups["other-site-9"] = ["bob@contoso.com"]
+        api.on("GET", f"{SITE_REST}/sitegroups", graph_error(503, "serviceNotAvailable"))
+
+        await connector._sync_user_groups()
+
+        assert db.kept_user_groups == [f"{SITE_ID}-7"]
         assert db.user_groups[f"{SITE_ID}-7"] == ["ana@contoso.com"]
 
 

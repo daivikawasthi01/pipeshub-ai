@@ -104,6 +104,7 @@ from app.sources.external.servicenow.models import (
 from app.utils.streaming import create_stream_record_response
 from app.utils.time_conversion import datetime_to_epoch_ms
 from app.connectors.sources.servicenow.servicenow.constants import (
+    CRITERIA_ALLOW_INCLUDES_CHILD_GROUPS,
     ORGANIZATIONAL_ENTITIES,
     OrganizationalEntityConfig,
     ServiceNowConfigPaths,
@@ -120,6 +121,10 @@ from app.connectors.sources.servicenow.servicenow.constants import (
     ServiceNowURLPatterns,
 )
 
+
+
+class _DenyUnreadable(Exception):
+    """A Cannot Read criteria could not be resolved to users; nothing may be granted."""
 
 
 @ConnectorBuilder(ServiceNowConnectorMetadata.NAME)\
@@ -201,6 +206,7 @@ from app.connectors.sources.servicenow.servicenow.constants import (
         .with_agent_support(False)
     )\
     .build_decorator()
+
 class ServiceNowConnector(BaseConnector):
     """
     ServiceNow Knowledge Base Connector
@@ -255,9 +261,15 @@ class ServiceNowConnector(BaseConnector):
         # Whether article criteria override the criteria of the knowledge base.
         # Read from the instance during init(); false is the ServiceNow default.
         self.apply_article_read_criteria: bool = False
-        self.client_id: Optional[str] = None
-        self.client_secret: Optional[str] = None
-        self.redirect_uri: Optional[str] = None
+        # source user sys_id -> email, read once per sync run (see _process_criteria_permissions)
+        self._email_by_source_id: dict[str, str] | None = None
+        # KB sys_id -> (Can Read ids, Cannot Read ids), read once per run for articles with Cannot Read
+        self._kb_criteria_cache: dict[str, tuple[list[str], list[str]]] = {}
+        self._admin_source_ids: set | None = None
+        self._kb_owner_cache: dict[str, set] = {}
+        self.client_id: str | None = None
+        self.client_secret: str | None = None
+        self.redirect_uri: str | None = None
 
         # OAuth tokens (managed by framework/client)
         self.access_token: Optional[str] = None
@@ -512,6 +524,10 @@ class ServiceNowConnector(BaseConnector):
         5. KB Articles (with admin permissions)
         """
         try:
+            self._email_by_source_id = None  # user listing is read once per run, after the user sync
+            self._kb_criteria_cache = {}
+            self._admin_source_ids = None
+            self._kb_owner_cache = {}
             org_id = self.data_entities_processor.org_id
             self.logger.info(f"🚀 Starting ServiceNow KB sync for org: {org_id}")
 
@@ -1899,13 +1915,20 @@ class ServiceNowConnector(BaseConnector):
                         kb_sys_id = kb_data.sys_id
 
                         # Fetch criteria IDs for this KB
-                        criteria_map = await self._fetch_kb_permissions_from_criteria(kb_sys_id)
+                        try:
+                            criteria_map = await self._fetch_kb_permissions_from_criteria(kb_sys_id)
 
-                        # Process READ permissions using shared method
-                        read_permissions = await self._process_criteria_permissions(
-                            criteria_map[ServiceNowDictKeys.READ],
-                            PermissionType.READ,
-                        )
+                            # Process READ permissions using shared method
+                            read_permissions = await self._process_criteria_permissions(
+                                criteria_map[ServiceNowDictKeys.READ],
+                                PermissionType.READ,
+                                deny_criteria_ids=criteria_map.get(ServiceNowDictKeys.CANNOT_READ, []),
+                            )
+                        except (_DenyUnreadable, ServiceNowAPIError) as e:
+                            # Cannot Read unknown: grant nothing for this KB, keep what is stored.
+                            self.logger.error(f"Skipping knowledge base {kb_sys_id}, its deny rules were not read in full: {e}")
+                            await self.data_entities_processor.note_kept_record_group(self.connector_id, kb_sys_id)
+                            continue
 
                         # Process WRITE permissions using shared method
                         write_permissions = await self._process_criteria_permissions(
@@ -2120,6 +2143,7 @@ class ServiceNowConnector(BaseConnector):
                                 ServiceNowFields.ACTIVE,
                                 ServiceNowFields.PUBLISHED,
                                 ServiceNowFields.CAN_READ_USER_CRITERIA,
+                                ServiceNowFields.CANNOT_READ_USER_CRITERIA,
                                 ServiceNowFields.SYS_CREATED_ON,
                                 ServiceNowFields.SYS_UPDATED_ON,
                             ]
@@ -2223,10 +2247,11 @@ class ServiceNowConnector(BaseConnector):
                 criteria_ids = [c.strip() for c in can_read_criteria.split(",") if c.strip()]
 
             # Process READ permissions using shared method
-            all_permission_objects = await self._process_criteria_permissions(
-                criteria_ids,
-                PermissionType.READ,
-            )
+            deny_ids = self._split_ids(getattr(article_data, ServiceNowFields.CANNOT_READ_USER_CRITERIA, None))
+            if deny_ids:
+                all_permission_objects = await self._article_deny_permissions(article_data, criteria_ids, deny_ids)
+            else:
+                all_permission_objects = await self._process_criteria_permissions(criteria_ids, PermissionType.READ)
 
             # Add OWNER permission from author field
             author_sys_id = article_data.author
@@ -2284,7 +2309,7 @@ class ServiceNowConnector(BaseConnector):
             return record_updates
 
         except Exception as e:
-            self.logger.error(f"Failed to process article {article_data.get('sys_id')}: {e}", exc_info=True)
+            self.logger.error(f"Failed to process article {getattr(article_data, 'sys_id', 'unknown')}: {e}", exc_info=True)
             return []
 
     async def _process_record_updates_batch(self, record_updates: List[RecordUpdate]) -> int:
@@ -2449,6 +2474,7 @@ class ServiceNowConnector(BaseConnector):
         try:
             criteria_map = {
                 ServiceNowDictKeys.READ: [],
+                ServiceNowDictKeys.CANNOT_READ: [],
                 ServiceNowDictKeys.WRITE: []
             }
 
@@ -2469,6 +2495,24 @@ class ServiceNowConnector(BaseConnector):
                         criteria_map[ServiceNowDictKeys.READ].append(criteria_id)
             except ServiceNowAPIError as e:
                 self.logger.warning(f"Failed to fetch READ criteria for KB {kb_sys_id}: {e.message}")
+
+            # Fetch Cannot Read criteria. A failed read raises: the KB would otherwise be
+            # granted to users it denies.
+            datasource = await self._get_fresh_datasource()
+            try:
+                deny_response = await datasource.get_now_table_tableName(
+                    tableName=ServiceNowTables.KB_UC_CANNOT_READ_MTOM,
+                    sysparm_query=f"{ServiceNowFields.KB_KNOWLEDGE_BASE}={kb_sys_id}",
+                    sysparm_fields=ServiceNowFields.USER_CRITERIA,
+                    sysparm_display_value=ServiceNowQueryValues.DISPLAY_VALUE_FALSE,
+                    sysparm_exclude_reference_link=ServiceNowQueryValues.EXCLUDE_REFERENCE_LINK_TRUE,
+                )
+            except ServiceNowAPIError as e:
+                self.logger.error(f"Failed to fetch Cannot Read criteria for KB {kb_sys_id}: {e.message}")
+                raise
+            for record in deny_response.result:
+                if record.user_criteria:
+                    criteria_map[ServiceNowDictKeys.CANNOT_READ].append(record.user_criteria)
 
             # Fetch WRITE criteria (contribute)
             datasource = await self._get_fresh_datasource()
@@ -2492,11 +2536,12 @@ class ServiceNowConnector(BaseConnector):
 
         except Exception as e:
             self.logger.error(f"Failed to fetch KB permissions: {e}", exc_info=True)
-            return {ServiceNowDictKeys.READ: [], ServiceNowDictKeys.WRITE: []}
+            raise
 
     async def _process_criteria_permissions(
-        self, criteria_ids: List[str], permission_type: PermissionType,
-    ) -> List[Permission]:
+        self, criteria_ids: list[str], permission_type: PermissionType,
+        deny_criteria_ids: list[str] | None = None,
+    ) -> list[Permission]:
         """
         Shared method to process user_criteria IDs and extract permissions.
 
@@ -2504,56 +2549,257 @@ class ServiceNowConnector(BaseConnector):
         1. Batch fetches all user_criteria details
         2. Extracts permissions from each criteria
         3. Converts to Permission objects
+
+        The grant model has no deny and no AND. When a Cannot Read criteria applies, or a
+        criteria has Match All over more than one field, the allowed users are computed
+        here (allowed minus denied) and granted one by one. ServiceNow docs: a user who
+        matches both Can Read and Cannot Read is denied; Match All requires a match in every
+        populated field (any one element within a field), not just one field.
+        A failed read grants nothing: unknown is not allowed.
         """
         try:
             if not criteria_ids:
                 return []
 
-            permission_dicts = []
+            # Deny rows first: unknown deny must never read as "no deny".
+            deny_records = await self._fetch_deny_records(deny_criteria_ids or [])
+            can_records = [r for r in await self._fetch_user_criteria(criteria_ids) if self._criteria_is_active(r)]
 
-            # Batch fetch all user_criteria details
-            criteria_query = f"{ServiceNowFields.SYS_ID}IN{CommonStrings.COMMA.join(criteria_ids)}"
-            datasource = await self._get_fresh_datasource()
-            try:
-                criteria_response = await datasource.get_now_table_tableName(
-                    tableName=ServiceNowTables.USER_CRITERIA,
-                    sysparm_query=criteria_query,
-                    sysparm_fields=CommonStrings.COMMA.join(
-                        [
-                            ServiceNowFields.SYS_ID,
-                            ServiceNowFields.USER,
-                            ServiceNowFields.GROUP,
-                            ServiceNowFields.ROLE,
-                            ServiceNowFields.DEPARTMENT,
-                            ServiceNowFields.LOCATION,
-                            ServiceNowFields.COMPANY,
-                            ServiceNowFields.COST_CENTER,
-                        ]
-                    ),
-                    sysparm_display_value=ServiceNowQueryValues.DISPLAY_VALUE_FALSE,
-                    sysparm_exclude_reference_link=ServiceNowQueryValues.EXCLUDE_REFERENCE_LINK_TRUE,
-                )
-                
-                for criteria_record in criteria_response.result:
-                    # Extract permissions from this criteria
-                    perms = await self._extract_permissions_from_user_criteria_details(
-                        criteria_record,
-                        permission_type
+            if not deny_records and not any(self._needs_user_resolution(r) for r in can_records):
+                permission_dicts = []
+                for criteria_record in can_records:
+                    permission_dicts.extend(
+                        await self._extract_permissions_from_user_criteria_details(criteria_record, permission_type)
                     )
-                    permission_dicts.extend(perms)
-            except ServiceNowAPIError as e:
-                self.logger.warning(f"Failed to fetch user criteria details: {e.message}")
+                return await self._convert_permissions_to_objects(permission_dicts)
 
-            # Convert to Permission objects
-            permission_objects = await self._convert_permissions_to_objects(
-                permission_dicts,
-            )
+            users = await self._users_allowed_by(can_records, deny_records)
+            return await self._users_to_permissions(users, permission_type)
 
-            return permission_objects
-
+        except _DenyUnreadable:
+            raise
         except Exception as e:
             self.logger.error(f"Failed to process criteria permissions: {e}", exc_info=True)
             return []
+
+    async def _fetch_deny_records(self, deny_ids: list[str]) -> list[TableAPIRecord]:
+        """Active Cannot Read user_criteria rows. A failed read raises _DenyUnreadable."""
+        try:
+            return [r for r in await self._fetch_user_criteria(deny_ids) if self._criteria_is_active(r)]
+        except Exception as e:
+            raise _DenyUnreadable(str(e)) from e
+
+    async def _users_allowed_by(self, can_records: list[TableAPIRecord], deny_records: list[TableAPIRecord]) -> set[str]:
+        """Users matching any allow row minus users matching any deny row. A deny that cannot be
+        resolved raises _DenyUnreadable; an allow that cannot be resolved raises too (grants nothing)."""
+        denied: set[str] = set()
+        for record in deny_records:
+            try:
+                denied |= await self._users_matching_criteria(record, deny=True)
+            except Exception as e:
+                raise _DenyUnreadable(str(e)) from e
+        allowed: set[str] = set()
+        for record in can_records:
+            allowed |= await self._users_matching_criteria(record)
+        return allowed - denied
+
+    async def _effective_users(self, allow_ids: list[str], deny_ids: list[str]) -> set[str]:
+        deny_records = await self._fetch_deny_records(deny_ids)
+        can_records = [r for r in await self._fetch_user_criteria(allow_ids) if self._criteria_is_active(r)]
+        return await self._users_allowed_by(can_records, deny_records)
+
+    async def _users_to_permissions(self, users: set[str], permission_type: PermissionType) -> list[Permission]:
+        # One user listing per sync run, not a lookup per user or per article.
+        if self._email_by_source_id is None:
+            self._email_by_source_id = {
+                u.source_user_id: u.email
+                for u in await self.data_entities_processor.get_all_app_users(connector_id=self.connector_id)
+                if u.source_user_id and u.email
+            }
+        email_by_id = self._email_by_source_id
+        return [
+            Permission(email=email_by_id[u], type=permission_type, entity_type=EntityType.USER)
+            for u in sorted(users) if u in email_by_id
+        ]
+
+    async def _article_deny_permissions(
+        self, article_data: TableAPIRecord, own_ids: list[str], deny_ids: list[str]
+    ) -> list[Permission]:
+        """Explicit READ grants of an article that has Cannot Read criteria.
+
+        An inherited KB grant cannot be taken back, so such an article does not inherit and gets the
+        effective set: (KB Can Read minus KB and article Cannot Read), narrowed by the article's own
+        Can Read if it has one. ServiceNow docs: Cannot Read wins over Can Read at KB and article level
+        (https://www.servicenow.com/docs/r/servicenow-platform/knowledge-management/user-access-knowledge.html).
+        Where the article override property is on, the article's own Can Read replaces the KB's.
+        Any unreadable rule raises, so the article is skipped and its stored grants stay.
+        """
+        if self.apply_article_read_criteria and own_ids:
+            users = await self._effective_users(own_ids, deny_ids)
+        else:
+            kb_id = article_data.kb_knowledge_base
+            if kb_id not in self._kb_criteria_cache:
+                kb_map = await self._fetch_kb_permissions_from_criteria(kb_id)
+                self._kb_criteria_cache[kb_id] = (
+                    kb_map[ServiceNowDictKeys.READ],
+                    kb_map.get(ServiceNowDictKeys.CANNOT_READ, []),
+                )
+            kb_allow, kb_deny = self._kb_criteria_cache[kb_id]
+            users = await self._effective_users(kb_allow, kb_deny + deny_ids)
+            if own_ids:
+                users &= await self._effective_users(own_ids, [])
+        # Knowledge admins read every KB and article, and a KB's owner and managers read their KB, without
+        # user criteria being evaluated (ServiceNow docs, "Managing access to knowledge bases and knowledge
+        # articles": https://www.servicenow.com/docs/r/servicenow-platform/knowledge-management/user-access-knowledge.html).
+        # The KB loop grants the same people, so an article that stops inheriting must keep them.
+        users |= await self._kb_privileged_users(article_data.kb_knowledge_base)
+        return await self._users_to_permissions(users, PermissionType.READ)
+
+    async def _kb_privileged_users(self, kb_id: str | None) -> set[str]:
+        """Source ids of the admin users plus the KB's owner and managers. Raises if unreadable."""
+        if self._admin_source_ids is None:
+            self._admin_source_ids = {a.source_user_id for a in await self._get_admin_users() if a.source_user_id}
+        people = set(self._admin_source_ids)
+        if kb_id and kb_id not in self._kb_owner_cache:
+            datasource = await self._get_fresh_datasource()
+            response = await datasource.get_now_table_tableName(
+                tableName=ServiceNowTables.KB_KNOWLEDGE_BASE,
+                sysparm_query=f"{ServiceNowFields.SYS_ID}={kb_id}",
+                sysparm_fields=CommonStrings.COMMA.join([ServiceNowFields.OWNER, ServiceNowFields.KB_MANAGERS]),
+                sysparm_display_value=ServiceNowQueryValues.DISPLAY_VALUE_FALSE,
+                sysparm_exclude_reference_link=ServiceNowQueryValues.EXCLUDE_REFERENCE_LINK_TRUE,
+            )
+            ids: set[str] = set()
+            for row in response.result:
+                ids |= set(self._split_ids(getattr(row, ServiceNowFields.OWNER, None)))
+                ids |= set(self._split_ids(getattr(row, ServiceNowFields.KB_MANAGERS, None)))
+            self._kb_owner_cache[kb_id] = ids
+        return people | self._kb_owner_cache.get(kb_id, set())
+
+    _CRITERIA_DIMENSIONS = (
+        ServiceNowFields.USER, ServiceNowFields.GROUP, ServiceNowFields.ROLE,
+        ServiceNowFields.DEPARTMENT, ServiceNowFields.LOCATION, ServiceNowFields.COMPANY,
+    )
+
+    @staticmethod
+    def _split_ids(value: object) -> list[str]:
+        return [s.strip() for s in str(value or "").split(",") if s.strip()]
+
+    @staticmethod
+    def _criteria_is_active(record: TableAPIRecord) -> bool:
+        return str(getattr(record, ServiceNowFields.ACTIVE, "true")).lower() != "false"
+
+    def _needs_user_resolution(self, record: TableAPIRecord) -> bool:
+        match_all = str(getattr(record, ServiceNowFields.MATCH_ALL, "false")).lower() == "true"
+        populated = [d for d in self._CRITERIA_DIMENSIONS if self._split_ids(getattr(record, d, None))]
+        return match_all and len(populated) > 1
+
+    async def _fetch_user_criteria(self, criteria_ids: list[str]) -> list[TableAPIRecord]:
+        """user_criteria rows by sys_id. Raises on an API error."""
+        if not criteria_ids:
+            return []
+        datasource = await self._get_fresh_datasource()
+        response = await datasource.get_now_table_tableName(
+            tableName=ServiceNowTables.USER_CRITERIA,
+            sysparm_query=f"{ServiceNowFields.SYS_ID}IN{CommonStrings.COMMA.join(criteria_ids)}",
+            sysparm_fields=CommonStrings.COMMA.join(
+                [
+                    ServiceNowFields.SYS_ID, ServiceNowFields.ACTIVE, ServiceNowFields.MATCH_ALL,
+                    *self._CRITERIA_DIMENSIONS, ServiceNowFields.COST_CENTER,
+                ]
+            ),
+            sysparm_display_value=ServiceNowQueryValues.DISPLAY_VALUE_FALSE,
+            sysparm_exclude_reference_link=ServiceNowQueryValues.EXCLUDE_REFERENCE_LINK_TRUE,
+        )
+        return list(response.result)
+
+    async def _with_child_groups(self, group_ids: list[str]) -> list[str]:
+        """The groups and all their descendants (sys_user_group.parent). Raises on any read error.
+
+        User criteria Group matching includes the members of child groups: reported by a
+        ServiceNow community answer that tested it
+        (https://www.servicenow.com/community/developer-forum/user-criteria-group-does-it-include-child-groups/m-p/1635493);
+        no official page was found. The same flattening is done for synced groups. Departments do not
+        include child departments, so they are not expanded.
+        """
+        seen = set(group_ids)
+        frontier = list(group_ids)
+        while frontier:
+            offset = ServiceNowDefaults.PAGINATION_OFFSET
+            children: list[str] = []
+            while True:
+                datasource = await self._get_fresh_datasource()
+                response = await datasource.get_now_table_tableName(
+                    tableName=ServiceNowTables.SYS_USER_GROUP,
+                    sysparm_query=f"{ServiceNowFields.PARENT}IN{CommonStrings.COMMA.join(frontier)}^ORDERBYsys_id",
+                    sysparm_fields=ServiceNowFields.SYS_ID,
+                    sysparm_limit=str(ServiceNowDefaults.BATCH_SIZE),
+                    sysparm_offset=str(offset),
+                    sysparm_display_value=ServiceNowQueryValues.DISPLAY_VALUE_FALSE,
+                    sysparm_no_count=ServiceNowQueryValues.NO_COUNT_TRUE,
+                    sysparm_exclude_reference_link=ServiceNowQueryValues.EXCLUDE_REFERENCE_LINK_TRUE,
+                )
+                children.extend(r.sys_id for r in response.result if getattr(r, "sys_id", None))
+                if len(response.result) < ServiceNowDefaults.BATCH_SIZE:
+                    break
+                offset += ServiceNowDefaults.BATCH_SIZE
+            frontier = [c for c in children if c not in seen]
+            seen.update(frontier)
+        return sorted(seen)
+
+    async def _users_matching_criteria(self, record: TableAPIRecord, *, deny: bool = False) -> set[str]:
+        """sys_ids of the users one user_criteria row matches. Raises if any read fails.
+
+        Child groups: whether group criteria match members of child groups is unverified (only a
+        community answer says yes:
+        https://www.servicenow.com/community/developer-forum/user-criteria-group-does-it-include-child-groups/m-p/1635493).
+        So the safe side is taken per set: a deny (Cannot Read) expands child groups (denies more),
+        an allow uses direct members only (grants less) unless CRITERIA_ALLOW_INCLUDES_CHILD_GROUPS is
+        turned on, which should happen only after checking on a real instance.
+        Roles count direct assignments (no hierarchy flattening). Scripted (advanced) criteria are not evaluated.
+        """
+        match_all = str(getattr(record, ServiceNowFields.MATCH_ALL, "false")).lower() == "true"
+        sources = {
+            ServiceNowFields.GROUP: (ServiceNowTables.SYS_USER_GRMEMBER, ServiceNowFields.GROUP, ServiceNowFields.USER),
+            ServiceNowFields.ROLE: (ServiceNowTables.SYS_USER_HAS_ROLE, ServiceNowFields.ROLE, ServiceNowFields.USER),
+            ServiceNowFields.DEPARTMENT: (ServiceNowTables.SYS_USER, ServiceNowFields.DEPARTMENT, ServiceNowFields.SYS_ID),
+            ServiceNowFields.LOCATION: (ServiceNowTables.SYS_USER, ServiceNowFields.LOCATION, ServiceNowFields.SYS_ID),
+            ServiceNowFields.COMPANY: (ServiceNowTables.SYS_USER, ServiceNowFields.COMPANY, ServiceNowFields.SYS_ID),
+        }
+        per_dimension: list[set[str]] = []
+        for dim in self._CRITERIA_DIMENSIONS:
+            ids = self._split_ids(getattr(record, dim, None))
+            if not ids:
+                continue
+            if dim == ServiceNowFields.USER:
+                per_dimension.append(set(ids))
+                continue
+            table, filter_field, user_field = sources[dim]
+            if dim == ServiceNowFields.GROUP and (deny or CRITERIA_ALLOW_INCLUDES_CHILD_GROUPS):
+                ids = await self._with_child_groups(ids)
+            users: set[str] = set()
+            offset = ServiceNowDefaults.PAGINATION_OFFSET
+            batch = ServiceNowDefaults.BATCH_SIZE
+            while True:
+                datasource = await self._get_fresh_datasource()
+                response = await datasource.get_now_table_tableName(
+                    tableName=table,
+                    sysparm_query=f"{filter_field}IN{CommonStrings.COMMA.join(ids)}^ORDERBYsys_id",
+                    sysparm_fields=user_field,
+                    sysparm_limit=str(batch),
+                    sysparm_offset=str(offset),
+                    sysparm_display_value=ServiceNowQueryValues.DISPLAY_VALUE_FALSE,
+                    sysparm_no_count=ServiceNowQueryValues.NO_COUNT_TRUE,
+                    sysparm_exclude_reference_link=ServiceNowQueryValues.EXCLUDE_REFERENCE_LINK_TRUE,
+                )
+                users.update(str(getattr(r, user_field)) for r in response.result if getattr(r, user_field, None))
+                if len(response.result) < batch:
+                    break
+                offset += batch
+            per_dimension.append(users)
+        if not per_dimension:
+            return set()
+        return set.intersection(*per_dimension) if match_all else set.union(*per_dimension)
 
     async def _extract_permissions_from_user_criteria_details(
         self, criteria_details: TableAPIRecord, permission_type: PermissionType
@@ -2978,7 +3224,9 @@ class ServiceNowConnector(BaseConnector):
             # receive the grants of its knowledge base, but only on an instance
             # where that override is switched on. See KBKnowledgeSNC.canRead.
             own_read_criteria = bool((article_data.can_read_user_criteria or "").strip())
-            inherit_permissions = not (self.apply_article_read_criteria and own_read_criteria)
+            # An article with Cannot Read criteria must not inherit either: the KB grant could not be taken back.
+            has_deny = bool(self._split_ids(getattr(article_data, ServiceNowFields.CANNOT_READ_USER_CRITERIA, None)))
+            inherit_permissions = not (has_deny or (self.apply_article_read_criteria and own_read_criteria))
 
             # Create WebpageRecord for Article
             record_id = str(uuid.uuid4())

@@ -1314,7 +1314,7 @@ class TestProcessGroup:
                               {"type": "CUSTOMER", "email": "cust@e.com", "id": "c1"},
                           ]):
             await connector._process_group(group)
-            connector.data_entities_processor.on_new_user_groups.assert_not_called()
+            connector.data_entities_processor.on_new_user_groups.assert_called_once()  # emptied group is written with no members
 
     @pytest.mark.asyncio
     async def test_group_fallback_name(self, connector):

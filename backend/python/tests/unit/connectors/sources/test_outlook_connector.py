@@ -635,8 +635,8 @@ class TestGetGroupMembers:
         connector.external_users_client.groups_list_transitive_members = AsyncMock(
             return_value=_make_graph_response(success=False, error="Forbidden")
         )
-        result = await connector._get_group_members("g1")
-        assert result == []
+        with pytest.raises(RuntimeError):
+            await connector._get_group_members("g1")  # a partial list must not replace stored members
 
 
 # ===========================================================================
@@ -5518,6 +5518,7 @@ class TestSyncUserGroupsErrorHandling:
         connector._get_all_microsoft_365_groups = AsyncMock(return_value=[group1, group2])
         connector._get_group_members = AsyncMock(side_effect=[Exception("Err"), []])
         connector._transform_group_to_record_group = MagicMock(return_value=None)
+        connector.data_entities_processor.note_kept_user_group = AsyncMock()
 
         result = await connector._sync_user_groups()
         assert len(result) >= 1

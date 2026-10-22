@@ -39,6 +39,7 @@ from msgraph.generated.groups.item.group_item_request_builder import (
 from msgraph.generated.models.drive_item import DriveItem
 from msgraph.generated.models.group import Group
 from msgraph.generated.models.list_item import ListItem
+from msgraph.generated.models.sharepoint_ids import SharepointIds
 from msgraph.generated.models.site import Site
 from msgraph.generated.models.site_page import SitePage
 from msgraph.generated.models.subscription import Subscription
@@ -2823,9 +2824,14 @@ class SharePointConnector(BaseConnector):
                 return {'id': user_id, 'email': email, 'name': getattr(item, 'display_name', 'Unknown')}
         return None
 
-    async def _fetch_graph_group_members(self, group_id: str, is_owner: bool = False) -> List[dict]:
+    async def _fetch_graph_group_members(
+        self, group_id: str, is_owner: bool = False, *, raise_on_error: bool = False
+    ) -> list[dict]:
         """
         Fetches ALL user members from an M365 Group via Graph API, handling pagination.
+
+        With ``raise_on_error`` a failed page raises instead of returning the partial list,
+        for callers that replace stored members with the result.
         """
         users = []
         try:
@@ -2865,6 +2871,8 @@ class SharePointConnector(BaseConnector):
 
         except Exception as e:
             self.logger.warning(f"⚠️ Failed to expand M365 Group {group_id}: {e}")
+            if raise_on_error:
+                raise
             return users # Return whatever we found so far
 
     async def _get_drive_permissions(self, site_id: str, drive_id: str) -> List[Permission]:
@@ -3155,8 +3163,11 @@ class SharePointConnector(BaseConnector):
         self._directory_object_types[object_id] = object_type
         return object_type
 
-    async def _get_directory_role_member_users(self, role_id: str) -> list[dict]:
-        """Users holding a directory role, directly or through a role-assignable group."""
+    async def _get_directory_role_member_users(self, role_id: str, *, raise_on_error: bool = False) -> list[dict]:
+        """Users holding a directory role, directly or through a role-assignable group.
+
+        With ``raise_on_error`` a failed read raises instead of returning (and caching) the partial list.
+        """
         if role_id in self._directory_role_members:
             return self._directory_role_members[role_id]
         users: list[dict] = []
@@ -3170,7 +3181,7 @@ class SharePointConnector(BaseConnector):
                     if user:
                         users.append(user)
                     elif 'group' in (getattr(member, 'odata_type', None) or '').lower() and getattr(member, 'id', None):
-                        users.extend(await self._fetch_graph_group_members(member.id))
+                        users.extend(await self._fetch_graph_group_members(member.id, raise_on_error=raise_on_error))
                 next_link = getattr(response, 'odata_next_link', None)
                 if not next_link:
                     break
@@ -3178,6 +3189,8 @@ class SharePointConnector(BaseConnector):
                     response = await members.with_url(next_link).get()
         except Exception as e:
             self.logger.warning(f"⚠️ Could not read all members of directory role {role_id} ({len(users)} read): {e}")
+            if raise_on_error:
+                raise
         self.logger.info(f"✅ Directory role {role_id} has {len(users)} member users")
         self._directory_role_members[role_id] = users
         return users
@@ -3244,7 +3257,7 @@ class SharePointConnector(BaseConnector):
             )
             return None
 
-    async def _get_drive_sharepoint_ids(self, drive_id: str) -> object:
+    async def _get_drive_sharepoint_ids(self, drive_id: str) -> SharepointIds | None:
         try:
             query = DriveItemRequestBuilder.DriveItemRequestBuilderGetQueryParameters(select=["id", "sharePointIds"])
             async with self.rate_limiter:
@@ -3452,6 +3465,7 @@ class SharePointConnector(BaseConnector):
 
                                 if not site_details or not site_details.web_url:
                                     self.logger.debug(f"No web URL available for site: {site_name}")
+                                    await self._keep_stored_site_groups(site_id)
                                     continue
 
                                 site_web_url = site_details.web_url
@@ -3528,7 +3542,7 @@ class SharePointConnector(BaseConnector):
                                                                 is_owner_check = 'Owner' in group_title
 
                                                                 # Call helper to get actual humans from Graph
-                                                                expanded_users = await self._fetch_graph_group_members(m365_id, is_owner=is_owner_check)
+                                                                expanded_users = await self._fetch_graph_group_members(m365_id, is_owner=is_owner_check, raise_on_error=True)
 
                                                                 for exp_u in expanded_users:
                                                                     app_users.append(AppUser(
@@ -3553,11 +3567,11 @@ class SharePointConnector(BaseConnector):
                                                                 claim_id = match.group(1)
                                                                 if await self._get_directory_object_type(claim_id) == DIRECTORY_ROLE_ODATA_TYPE:
                                                                     self.logger.info(f"     -> Expanding directory role: {claim_id}")
-                                                                    expanded_users = await self._get_directory_role_member_users(claim_id)
+                                                                    expanded_users = await self._get_directory_role_member_users(claim_id, raise_on_error=True)
                                                                 else:
                                                                     self.logger.info(f"     -> Expanding Security Group: {claim_id}")
                                                                     # Security groups imply members (is_owner=False)
-                                                                    expanded_users = await self._fetch_graph_group_members(claim_id, is_owner=False)
+                                                                    expanded_users = await self._fetch_graph_group_members(claim_id, is_owner=False, raise_on_error=True)
 
                                                                 for exp_u in expanded_users:
                                                                     app_users.append(AppUser(
@@ -3586,10 +3600,16 @@ class SharePointConnector(BaseConnector):
                                                 else:
                                                     self.logger.info("   - No entities in this group")
                                             else:
-                                                self.logger.info(f"   - Error fetching users: {users_response.status_code}")
+                                                raise RuntimeError(f"HTTP {users_response.status_code}")
 
                                         except Exception as user_error:
-                                            self.logger.info(f"   - Exception fetching users: {user_error}")
+                                            # Unknown is not empty: writing the partial list would replace
+                                            # the stored members, so keep them for this run.
+                                            self.logger.warning(f"   - Could not read all users of {group_title}, keeping stored members: {user_error}")
+                                            await self.data_entities_processor.note_kept_user_group(
+                                                self.connector_id, unique_source_id
+                                            )
+                                            continue
 
                                         sharepoint_groups_with_members.append((user_group, app_users))
                                         total_groups += 1
@@ -3597,8 +3617,10 @@ class SharePointConnector(BaseConnector):
 
                                 elif response.status_code == HTTPStatus.UNAUTHORIZED:
                                     self.logger.info(" 401 Unauthorized Error")
+                                    await self._keep_stored_site_groups(site_id)
                                 else:
                                     self.logger.info(f" Error: {response.status_code}")
+                                    await self._keep_stored_site_groups(site_id)
 
                             except Exception as site_error:
                                 self.logger.error(
@@ -3608,6 +3630,7 @@ class SharePointConnector(BaseConnector):
                                 self.logger.debug(
                                     f"Traceback processing site {site_name}: {traceback.format_exc()}"
                                 )
+                                await self._keep_stored_site_groups(site_id)
                                 continue
 
                     # Process all SharePoint site groups
@@ -3738,7 +3761,7 @@ class SharePointConnector(BaseConnector):
         Returns None if processing fails.
         """
         try:
-            members = await self.msgraph_client.get_group_members(group.id)
+            members = await self.msgraph_client.get_group_members(group.id, raise_on_error=True)
 
             user_group = AppUserGroup(
                 source_user_group_id=group.id,
@@ -3767,6 +3790,7 @@ class SharePointConnector(BaseConnector):
 
         except Exception as e:
             self.logger.error(f"❌ Error processing group {group.display_name}: {e}", exc_info=True)
+            await self._keep_stored_group(group.id)
             return None
 
     async def _perform_delta_sync(self, url: str, sync_point_key: str) -> None:
@@ -3854,6 +3878,20 @@ class SharePointConnector(BaseConnector):
         else:
             self.logger.info(f"    -> [DELTA] 👤✨ ADDING member: {email} ({user_id}) to group {group_id}")
 
+    async def _keep_stored_site_groups(self, site_id: str) -> None:
+        """The site's group list could not be read: its groups' existence is unknown, so keep
+        every stored one (their ids are ``{site_id}-{group_id}``) through the full-sync unlink."""
+        stored = await self.data_entities_processor.get_all_user_groups(self.connector_id, raise_on_error=True)
+        self.data_entities_processor.note_kept_user_groups(
+            self.connector_id,
+            [g for g in stored if (g.source_user_group_id or "").startswith(f"{site_id}-")],
+        )
+
+    async def _keep_stored_group(self, group_id: str | None) -> None:
+        """A group's members could not be read in full: keep what is stored (add-only)."""
+        if group_id:
+            await self.data_entities_processor.note_kept_user_group(self.connector_id, group_id)
+
     async def _handle_group_create(self, group: Group) -> bool:
         """
         Handles the creation or update of a single user group.
@@ -3869,7 +3907,7 @@ class SharePointConnector(BaseConnector):
         """
         try:
             # 1. Fetch latest members for this group
-            members = await self.msgraph_client.get_group_members(group.id)
+            members = await self.msgraph_client.get_group_members(group.id, raise_on_error=True)
 
             # 2. Create AppUserGroup entity
             user_group = AppUserGroup(
@@ -3909,6 +3947,7 @@ class SharePointConnector(BaseConnector):
 
         except Exception as e:
             self.logger.error(f"❌ Error handling group create for {getattr(group, 'id', 'unknown')}: {e}", exc_info=True)
+            await self._keep_stored_group(getattr(group, 'id', None))
             return False
 
 
@@ -3928,7 +3967,8 @@ class SharePointConnector(BaseConnector):
         app_users = []
 
         try:
-            nested_members = await self.msgraph_client.get_group_members(nested_group.id)
+            # Raises: a nested group read in part would replace the parent's members with a truncated list.
+            nested_members = await self.msgraph_client.get_group_members(nested_group.id, raise_on_error=True)
 
             for nested_member in nested_members:
                 nested_odata_type = getattr(nested_member, 'odata_type', None) or (nested_member.additional_data or {}).get('@odata.type', '')
@@ -3942,6 +3982,7 @@ class SharePointConnector(BaseConnector):
 
         except Exception as e:
             self.logger.warning(f"Failed to fetch members from nested group {nested_group_name}: {e}")
+            raise
 
         return app_users
 

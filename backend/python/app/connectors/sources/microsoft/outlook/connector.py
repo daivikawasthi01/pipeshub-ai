@@ -790,6 +790,9 @@ class OutlookConnector(BaseConnector):
                 except Exception as e:
                     group_name = group.display_name or 'unknown'
                     self.logger.error(f"Error processing group {group_name}: {e}")
+                    # Unknown is not empty: keep the stored members of this group.
+                    if group.id:
+                        await self.data_entities_processor.note_kept_user_group(self.connector_id, group.id)
                     continue
 
             # Process remaining groups
@@ -873,8 +876,9 @@ class OutlookConnector(BaseConnector):
                 )
 
                 if not response.success:
-                    self.logger.error(f"Failed to get members page {page_num} for group {group_id}: {response.error}")
-                    break
+                    # Raise: the caller replaces the stored members with this list, so a
+                    # partial one must not reach it.
+                    raise RuntimeError(f"Failed to get members page {page_num} for group {group_id}: {response.error}")
 
                 # response.data is DirectoryObjectCollectionResponse with .value containing list[User]
                 members_page = response.data.value if response.data.value else []
@@ -891,7 +895,7 @@ class OutlookConnector(BaseConnector):
 
         except Exception as e:
             self.logger.error(f"Error getting group members for {group_id}: {e}")
-            return []
+            raise
 
     async def _get_user_groups(self, user_id: str) -> list[Group]:
         """Get groups that a user is a member of (cached for performance).

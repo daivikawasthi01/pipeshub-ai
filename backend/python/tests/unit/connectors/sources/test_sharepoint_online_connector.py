@@ -2402,8 +2402,10 @@ class TestProcessSingleGroup:
         group.id = "g1"
         group.display_name = "Fail"
 
+        c.data_entities_processor.note_kept_user_group = AsyncMock()
         result = await c._process_single_group(group)
         assert result is None
+        c.data_entities_processor.note_kept_user_group.assert_awaited_once_with(c.connector_id, "g1")
 
 
 # =============================================================================
@@ -2584,8 +2586,10 @@ class TestHandleGroupCreate:
         group.id = "g1"
         group.display_name = "G"
 
+        c.data_entities_processor.note_kept_user_group = AsyncMock()
         result = await c._handle_group_create(group)
         assert result is False
+        c.data_entities_processor.note_kept_user_group.assert_awaited_once_with(c.connector_id, "g1")
 
 
 # =============================================================================
@@ -2644,8 +2648,8 @@ class TestGetUsersFromNestedGroup:
         nested.id = "ng1"
         nested.display_name = "Nested"
 
-        result = await c._get_users_from_nested_group(nested)
-        assert result == []
+        with pytest.raises(Exception, match="fail"):
+            await c._get_users_from_nested_group(nested)  # a truncated nested list must not reach the parent
 
 
 # =============================================================================

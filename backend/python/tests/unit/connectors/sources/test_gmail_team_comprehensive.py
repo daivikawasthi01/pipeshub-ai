@@ -651,7 +651,7 @@ class TestGmailProcessGroup:
             {"type": "GROUP", "email": "subgroup@test.com"},
         ])
         await connector._process_group(group)
-        connector.data_entities_processor.on_new_user_groups.assert_not_called()
+        connector.data_entities_processor.on_new_user_groups.assert_called_once()  # emptied group is written with no members
 
 
 # ===========================================================================

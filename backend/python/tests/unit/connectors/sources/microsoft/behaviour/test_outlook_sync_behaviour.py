@@ -377,9 +377,6 @@ class TestGroups:
         assert record.inherit_permissions is True
         assert db.record_permissions["p1"] == []
 
-    @pytest.mark.xfail(strict=True, reason=(
-        "When a group's member list can't be read, the group is saved with no members, so everyone loses the "
-        "access the group gives (outlook/connector.py:858-894, 753-772)"))
     async def test_a_failed_member_read_keeps_the_stored_members(self, connector, api, db) -> None:
         serve_group(api, graph_error(500, "ErrorInternalServerError"))
         db.user_groups[GROUP] = [ANA]
@@ -388,9 +385,6 @@ class TestGroups:
 
         assert db.user_groups[GROUP] == [ANA]
 
-    @pytest.mark.xfail(strict=True, reason=(
-        "When a later page of a group's members can't be read, the group is saved with only the members read so "
-        "far, removing the rest (outlook/connector.py:874-880)"))
     async def test_a_failed_later_member_page_keeps_the_stored_members(self, connector, api, db) -> None:
         def members(request: httpx.Request) -> httpx.Response:
             if api.query(request).get("$skiptoken") == "2":

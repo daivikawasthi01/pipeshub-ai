@@ -2156,6 +2156,11 @@ class GoogleGmailTeamConnector(BaseConnector):
                                 f"Error processing group {group.get('id', 'unknown')}: {e}",
                                 exc_info=True
                             )
+                            # Unknown is not empty: keep the stored members of this group.
+                            if group.get("email"):
+                                await self.data_entities_processor.note_kept_user_group(
+                                    self.connector_id, group["email"]
+                                )
                             continue
 
                     # Check for next page
@@ -2258,11 +2263,14 @@ class GoogleGmailTeamConnector(BaseConnector):
                     continue
 
             # Send to processor
-            if app_users:
+            if app_users or not user_members:
+                # The member read finished (it raises otherwise), so an empty list is real:
+                # write it, so the members of a group that was emptied are replaced.
                 await self.data_entities_processor.on_new_user_groups([(user_group, app_users)])
                 self.logger.debug(f"Processed group '{group_name}' with {len(app_users)} members")
             else:
-                self.logger.debug(f"Group '{group_name}' has no user members, skipping")
+                self.logger.warning(f"Group '{group_name}': no member had an email, keeping stored members")
+                await self.data_entities_processor.note_kept_user_group(self.connector_id, group_id)
 
         except Exception as e:
             self.logger.error(f"Error processing group {group.get('id', 'unknown')}: {e}", exc_info=True)

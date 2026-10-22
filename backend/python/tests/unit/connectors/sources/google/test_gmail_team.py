@@ -1605,7 +1605,7 @@ class TestProcessGroup:
             {"type": "GROUP", "email": "sub@t.com"},
         ])
         await connector_fullcov._process_group({"email": "grp@t.com", "name": "Grp"})
-        connector_fullcov.data_entities_processor.on_new_user_groups.assert_not_awaited()
+        connector_fullcov.data_entities_processor.on_new_user_groups.assert_awaited_once()  # emptied group is written with no members
 
     @pytest.mark.asyncio
     async def test_member_lookup_in_synced_users(self, connector_fullcov):
