@@ -1,5 +1,8 @@
 from abc import ABC, abstractmethod
 import asyncio
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+import copy
 from logging import Logger
 from typing import Any, Dict, List, Optional
 
@@ -281,6 +284,41 @@ class BaseConnector(ABC):
     @abstractmethod
     def handle_webhook_notification(self, notification: Dict) -> None:
         NotImplementedError("This method is not supported")
+
+    # Names of the zero-argument steps of this connector's own sync that create the user,
+    # group and app edges. Empty: the connector is not linked after a user is added (see
+    # EntityEventService._link_user_to_connectors).
+    user_link_steps: tuple[str, ...] = ()
+
+    async def link_new_users(self) -> None:
+        """Run the user and group steps of the sync, without touching content.
+
+        Called after a user is added, never while this connector syncs. The steps are the
+        sync's own, so the source alone decides what the new user may reach; they must be
+        idempotent.
+        """
+        for step in self.user_link_steps:
+            await getattr(self, step)()
+
+    # Bumped by a connector's run_sync when it starts; see _keep_sync_state.
+    _sync_generation: int = 0
+
+    @contextmanager
+    def _keep_sync_state(self, *names: str) -> Iterator[Callable[[], bool]]:
+        """Leave the named sync bookkeeping fields as they were once the block ends.
+
+        Yields ``still_mine()``: False once a sync has started since the block began. From
+        then on the fields belong to that sync, so the block stops writing (callers check
+        it between steps) and restores nothing.
+        """
+        generation = self._sync_generation
+        saved = {name: copy.copy(getattr(self, name)) for name in names}
+        try:
+            yield lambda: self._sync_generation == generation
+        finally:
+            if self._sync_generation == generation:
+                for name, value in saved.items():
+                    setattr(self, name, value)
 
     @abstractmethod
     async def cleanup(self) -> None:

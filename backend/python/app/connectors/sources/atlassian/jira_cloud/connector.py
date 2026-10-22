@@ -748,6 +748,7 @@ class JiraConnector(BaseConnector):
 
     async def run_sync(self) -> None:
         """Main sync flow: users → groups → projects/roles → issues → deletions."""
+        self._sync_generation += 1  # a link pass that began earlier must not touch this sync's state
         try:
             # 1. Init is done by event_service / setup before run_sync is scheduled
             if not self.data_source:
@@ -1764,6 +1765,39 @@ class JiraConnector(BaseConnector):
     # ============================================================================
     # Users, Roles, Groups and Projects Management
     # ============================================================================
+
+    # Bookkeeping a full sync reads at its end; a link pass must leave it as it found it.
+    _SYNC_STATE = (
+        "_kept_unread_access", "_kept_after_refusal", "_user_read_unfinished", "_user_bulk_forbidden",
+        "_group_bulk_forbidden", "_app_roles_unread", "_projects_naming_unread_roles",
+    )
+    user_link_steps = ("_link_users_groups_and_roles",)
+
+    async def _link_users_groups_and_roles(self) -> None:
+        """Sync steps 4-6 without the project grants and issues: users, groups, project and lead roles.
+
+        Edges that come with issues (creator, reporter, assignee) and the project permission
+        schemes are written by the next full sync.
+        """
+        if not self.data_source:
+            return
+        with self._keep_sync_state(*self._SYNC_STATE) as still_mine:
+            self._kept_unread_access = False
+            self._kept_after_refusal = []
+            jira_users = await self._fetch_users()
+            if jira_users:
+                await self.data_entities_processor.on_new_app_users(jira_users)
+            if not still_mine():
+                return
+            groups_members_map = await self._sync_user_groups(jira_users)
+            if not still_mine():
+                return
+            projects, raw_projects = await self._fetch_filtered_projects(jira_users)
+            if not still_mine():
+                return
+            if groups_members_map is not None:
+                await self._sync_project_roles([proj.short_name for proj, _ in projects], jira_users, groups_members_map)
+            await self._sync_project_lead_roles(raw_projects, jira_users)
 
     async def _fetch_users(
         self, active_pipeshub_users: Optional[list[AppUser]] = None
