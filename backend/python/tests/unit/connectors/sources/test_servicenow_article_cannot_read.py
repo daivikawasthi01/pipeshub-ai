@@ -132,3 +132,27 @@ async def test_articles_with_cannot_read_are_re_read_every_run_without_moving_th
     assert "cannot_read_user_criteriaISNOTEMPTY" in queries[1] and "sys_updated_on<=2024-06-01 00:00:00" in queries[1]
     assert [c.args[0].sys_id for c in sc._process_single_article.await_args_list] == ["old"]
     sc.article_sync_point.update_sync_point.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_admin_read_skips_the_article_so_its_stored_admin_grants_stay(servicenow_connector) -> None:  # noqa: F811
+    from types import SimpleNamespace
+
+    from app.sources.external.servicenow.models import ServiceNowAPIError
+
+    sc = servicenow_connector
+    T._wire(sc, {"kbcan": {"sys_id": "kbcan", "user": "u1"}, "deny1": {"sys_id": "deny1", "user": "u3"}}, {})
+    sc._fetch_kb_permissions_from_criteria = AsyncMock(return_value={"read": ["kbcan"], "cannot_read": [], "write": []})
+    sc._kb_privileged_users = type(sc)._kb_privileged_users.__get__(sc)  # the real one
+    sc._get_admin_users = AsyncMock(side_effect=ServiceNowAPIError(500, "fail", None))
+    sc._transform_to_article_webpage_record = lambda _: SimpleNamespace(
+        rewrite_permissions=False, inherit_permissions=False, record_group_type=None, external_record_group_id="kb1")
+    sc._fetch_attachments_for_article = AsyncMock(return_value=[])
+    sc.data_entities_processor.on_new_records = AsyncMock()
+
+    updates = await sc._process_single_article(_art(cannot_read_user_criteria="deny1"))
+    await sc._process_record_updates_batch(updates)
+
+    assert updates == [], f"article written after a failed admin read: {updates}"
+    assert sc._admin_source_ids is None, "an unread admin list must not be cached"
+    sc.data_entities_processor.on_new_records.assert_not_awaited()

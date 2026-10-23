@@ -943,69 +943,50 @@ class ServiceNowConnector(BaseConnector):
         Get users with admin role from ServiceNow and match with platform users.
 
         Fetches users with admin role from sys_user_has_role table and matches them
-        with existing platform users in the database.
+        with existing platform users in the database. A failed read or lookup raises:
+        an empty list would be written as "no admins" and remove their grants.
 
         Returns:
             List[AppUser]: List of admin users from platform
         """
+        datasource = await self._get_fresh_datasource()
         try:
-            admin_users = []
+            response = await datasource.get_now_table_tableName(
+                tableName=ServiceNowTables.SYS_USER_HAS_ROLE,
+                sysparm_query=f"{ServiceNowFields.ROLE}.{ServiceNowFields.NAME}={ServiceNowRoles.ADMIN}^{ServiceNowFields.USER}.{ServiceNowFields.ACTIVE}=true",
+                sysparm_fields=CommonStrings.COMMA.join(
+                    [
+                        ServiceNowFields.USER,
+                        f"{ServiceNowFields.USER}.{ServiceNowFields.NAME}",
+                        f"{ServiceNowFields.USER}.{ServiceNowFields.SYS_ID}",
+                        f"{ServiceNowFields.USER}.{ServiceNowFields.EMAIL}",
+                    ]
+                ),
+                sysparm_display_value=ServiceNowQueryValues.DISPLAY_VALUE_FALSE,
+                sysparm_exclude_reference_link=ServiceNowQueryValues.EXCLUDE_REFERENCE_LINK_TRUE,
+                sysparm_no_count=ServiceNowQueryValues.NO_COUNT_TRUE,
+            )
+        except ServiceNowAPIError as e:
+            self.logger.error(f"Failed to fetch admin users from ServiceNow: {e.message}")
+            raise
+        role_assignments = response.result
+        self.logger.info(f"Found {len(role_assignments)} admin role assignments")
 
-            # Query sys_user_has_role for admin role assignments
-            datasource = await self._get_fresh_datasource()
-            try:
-                response = await datasource.get_now_table_tableName(
-                    tableName=ServiceNowTables.SYS_USER_HAS_ROLE,
-                    sysparm_query=f"{ServiceNowFields.ROLE}.{ServiceNowFields.NAME}={ServiceNowRoles.ADMIN}^{ServiceNowFields.USER}.{ServiceNowFields.ACTIVE}=true",
-                    sysparm_fields=CommonStrings.COMMA.join(
-                        [
-                            ServiceNowFields.USER,
-                            f"{ServiceNowFields.USER}.{ServiceNowFields.NAME}",
-                            f"{ServiceNowFields.USER}.{ServiceNowFields.SYS_ID}",
-                            f"{ServiceNowFields.USER}.{ServiceNowFields.EMAIL}",
-                        ]
-                    ),
-                    sysparm_display_value=ServiceNowQueryValues.DISPLAY_VALUE_FALSE,
-                    sysparm_exclude_reference_link=ServiceNowQueryValues.EXCLUDE_REFERENCE_LINK_TRUE,
-                    sysparm_no_count=ServiceNowQueryValues.NO_COUNT_TRUE,
-                )
-                
-                role_assignments = response.result
-            except ServiceNowAPIError as e:
-                self.logger.warning(f"Failed to fetch admin users from ServiceNow: {e.message}")
-                return []
-            self.logger.info(f"Found {len(role_assignments)} admin role assignments")
+        admin_sys_ids = {a.user for a in role_assignments if getattr(a, "user", None)}
+        self.logger.info(f"Found {len(admin_sys_ids)} unique admin users")
 
-            # Extract unique user sys_ids
-            admin_sys_ids = set()
-            for assignment in role_assignments:
-                    # user is now a sys_id string (not a reference object)
-                    user_sys_id = assignment.user if hasattr(assignment, 'user') else None
+        # Match with platform users using source_user_id; an admin with no platform account is skipped.
+        admin_users = []
+        for sys_id in admin_sys_ids:
+            app_user = await self.data_entities_processor.get_user_by_source_id(
+                source_user_id=sys_id,
+                connector_id=self.connector_id
+            )
+            if app_user:
+                admin_users.append(app_user)
 
-                    if user_sys_id:
-                        admin_sys_ids.add(user_sys_id)
-
-            self.logger.info(f"Found {len(admin_sys_ids)} unique admin users")
-
-            # Match with platform users using source_user_id
-            for sys_id in admin_sys_ids:
-                try:
-                    app_user = await self.data_entities_processor.get_user_by_source_id(
-                        source_user_id=sys_id,
-                        connector_id=self.connector_id
-                    )
-                    if app_user:
-                        admin_users.append(app_user)
-                except Exception as e:
-                    self.logger.warning(f"Error matching admin user {sys_id}: {e}")
-                    continue
-
-            self.logger.info(f"✅ Matched {len(admin_users)} admin users with platform accounts")
-            return admin_users
-
-        except Exception as e:
-            self.logger.error(f"❌ Error fetching admin users: {e}", exc_info=True)
-            return []
+        self.logger.info(f"✅ Matched {len(admin_users)} admin users with platform accounts")
+        return admin_users
 
     async def _sync_users(self) -> None:
         """
@@ -2680,7 +2661,8 @@ class ServiceNowConnector(BaseConnector):
         return await self._users_to_permissions(users, PermissionType.READ)
 
     async def _kb_privileged_users(self, kb_id: str | None) -> set[str]:
-        """Source ids of the admin users plus the KB's owner and managers. Raises if unreadable."""
+        """Source ids of the admin users plus the KB's owner and managers. Raises if unreadable,
+        so nothing is cached and the article keeps its stored grants."""
         if self._admin_source_ids is None:
             self._admin_source_ids = {a.source_user_id for a in await self._get_admin_users() if a.source_user_id}
         people = set(self._admin_source_ids)

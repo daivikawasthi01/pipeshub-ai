@@ -262,6 +262,20 @@ M365_OWNERS_DISPLAY_SUFFIX = " Owners"
 _PERMISSION_RANK = {PermissionType.READ: 0, PermissionType.WRITE: 1, PermissionType.OWNER: 2}
 
 
+def rest_error_reason(response: httpx.Response, limit: int = 300) -> str:
+    """The SharePoint REST error code and message (verbose or minimal OData), bounded; never the whole body."""
+    try:
+        body = response.json()
+        error = body.get("error") or body.get("odata.error") or {}
+        message = error.get("message")
+        if isinstance(message, dict):
+            message = message.get("value")
+        reason = " ".join(str(part) for part in (error.get("code"), message) if part)
+    except Exception:
+        reason = ""
+    return (reason or response.reason_phrase or "")[:limit]
+
+
 def is_org_wide_claim(login_name: str) -> bool:
     """Everyone except external users, or Everyone."""
     return 'spo-grid-all-users' in login_name or 'c:0(.s|true' in login_name
@@ -3604,7 +3618,9 @@ class SharePointConnector(BaseConnector):
                                                 else:
                                                     self.logger.info("   - No entities in this group")
                                             else:
-                                                raise RuntimeError(f"HTTP {users_response.status_code}")
+                                                raise RuntimeError(
+                                                    f"HTTP {users_response.status_code}: {rest_error_reason(users_response)}"
+                                                )
 
                                         except Exception as user_error:
                                             # Unknown is not empty: writing the partial list would replace

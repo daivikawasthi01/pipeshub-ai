@@ -630,15 +630,16 @@ class TestGetAdminUsers:
             assert len(result) == 1
             assert result[0].email == "admin@example.com"
 
-    async def test_no_admin_users_found(self, servicenow_connector):
+    async def test_failed_admin_read_raises(self, servicenow_connector) -> None:
+        # An empty list would be written as "no admins" and remove their grants.
         with patch.object(servicenow_connector, "_get_fresh_datasource", new_callable=AsyncMock) as mock_ds:
             mock_datasource = AsyncMock()
             mock_datasource.get_now_table_tableName = AsyncMock(
-                side_effect=ServiceNowAPIError(404, "Not found", None)
+                side_effect=ServiceNowAPIError(500, "fail", None)
             )
             mock_ds.return_value = mock_datasource
-            result = await servicenow_connector._get_admin_users()
-            assert result == []
+            with pytest.raises(ServiceNowAPIError):
+                await servicenow_connector._get_admin_users()
 
     async def test_dict_reference_field(self, servicenow_connector):
         with patch.object(servicenow_connector, "_get_fresh_datasource", new_callable=AsyncMock) as mock_ds:
@@ -661,11 +662,10 @@ class TestGetAdminUsers:
             result = await servicenow_connector._get_admin_users()
             assert result == []
 
-    async def test_exception_returns_empty(self, servicenow_connector):
+    async def test_exception_raises(self, servicenow_connector) -> None:
         with patch.object(servicenow_connector, "_get_fresh_datasource", new_callable=AsyncMock,
-                          side_effect=Exception("Network error")):
-            result = await servicenow_connector._get_admin_users()
-            assert result == []
+                          side_effect=Exception("Network error")), pytest.raises(Exception, match="Network error"):
+            await servicenow_connector._get_admin_users()
 
 
 # ===========================================================================
@@ -981,6 +981,19 @@ class TestRunSync:
              patch.object(servicenow_connector, "_sync_articles", new_callable=AsyncMock):
             await servicenow_connector.run_sync()
             mock_kb.assert_called_once_with([])
+
+    async def test_a_failed_admin_read_writes_no_kb_so_stored_admin_grants_stay(self, servicenow_connector) -> None:
+        servicenow_connector.servicenow_client = MagicMock()
+        with patch.object(servicenow_connector, "_sync_users_and_groups", new_callable=AsyncMock), \
+             patch.object(servicenow_connector, "_get_admin_users", new_callable=AsyncMock,
+                          side_effect=ServiceNowAPIError(500, "fail", None)), \
+             patch.object(servicenow_connector, "_sync_knowledge_bases", new_callable=AsyncMock) as mock_kb, \
+             patch.object(servicenow_connector, "_sync_articles", new_callable=AsyncMock) as mock_articles:
+            with pytest.raises(ServiceNowAPIError):
+                await servicenow_connector.run_sync()
+        assert not mock_kb.await_count and not mock_articles.await_count, (
+            f"KBs written {mock_kb.await_count}x, articles {mock_articles.await_count}x after a failed admin read"
+        )
 
     async def test_sync_propagates_exceptions(self, servicenow_connector):
         servicenow_connector.servicenow_client = MagicMock()
@@ -1731,7 +1744,7 @@ class TestGetAdminUsersDeep:
             assert result == []
 
     @pytest.mark.asyncio
-    async def test_match_exception_continues(self, servicenow_connector):
+    async def test_match_exception_raises(self, servicenow_connector) -> None:
         mock_ds = AsyncMock()
         mock_ds.get_now_table_tableName = AsyncMock(
             return_value=_table_api_response([{"user": "admin-1"}])
@@ -1742,10 +1755,8 @@ class TestGetAdminUsersDeep:
             side_effect=RuntimeError("lookup fail")
         )
 
-        with patch.object(servicenow_connector.logger, "warning") as mock_warn:
-            result = await servicenow_connector._get_admin_users()
-        assert result == []
-        mock_warn.assert_called()
+        with pytest.raises(RuntimeError, match="lookup fail"):
+            await servicenow_connector._get_admin_users()
 
 
 # ===========================================================================

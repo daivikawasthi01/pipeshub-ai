@@ -139,3 +139,21 @@ async def test_site_groups_read_in_full_leave_the_full_sync_complete(connector, 
     await connector._sync_user_groups()
 
     assert connector.full_sync_coverage().complete
+
+
+@pytest.mark.parametrize(("body", "reason"), [
+    ({"error": {"code": "-2147024891, System.UnauthorizedAccessException",
+                "message": {"lang": "en-US", "value": "Access denied."}}},
+     "-2147024891, System.UnauthorizedAccessException Access denied."),
+    ({"odata.error": {"code": "x", "message": {"value": "y" * 500}}}, ("x " + "y" * 500)[:300]),
+    (None, "Service Unavailable"),
+])
+def test_a_failed_site_group_read_names_the_vendor_reason_bounded(body, reason) -> None:
+    import httpx
+
+    from app.connectors.sources.microsoft.sharepoint_online.connector import (
+        rest_error_reason,
+    )
+
+    response = httpx.Response(503, json=body) if body is not None else httpx.Response(503, text="<html>down</html>")
+    assert rest_error_reason(response) == reason
