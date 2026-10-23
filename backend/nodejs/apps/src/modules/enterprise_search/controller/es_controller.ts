@@ -31,6 +31,7 @@ import {
 import { Logger } from '../../../libs/services/logger.service';
 import {
   BadRequestError,
+  ForbiddenError,
   InternalServerError,
   NotFoundError,
 } from '../../../libs/errors/http.errors';
@@ -83,6 +84,8 @@ import {
   attachPopulatedCitations,
   appendMessages,
   getMessages,
+  ownerOrWriterFilter,
+  assertNotReadOnlyViewer,
   attachMessages,
   appendMessageFeedback,
   findSessionIdsMatchingContent,
@@ -1330,7 +1333,7 @@ export const streamChatInternal =
 
 export const addMessageStream =
   (appConfig: AppConfig) =>
-  async (req: AuthenticatedUserRequest, res: Response) => {
+  async (req: AuthenticatedUserRequest, res: Response, next?: NextFunction) => {
     const requestId = req.context?.requestId;
     const startTime = Date.now();
     const userId = req.user?.userId;
@@ -1347,8 +1350,19 @@ export const addMessageStream =
       req.query as Record<string, unknown>,
     );
 
-    if (!req.body.query) {
-      throw new BadRequestError('Query is required');
+    // Express 4 drops a rejected async handler, so refusals before the stream
+    // starts go to `next` (the internal wrappers pass none and catch it themselves).
+    try {
+      if (!req.body.query) {
+        throw new BadRequestError('Query is required');
+      }
+      await assertNotReadOnlyViewer(
+        { _id: conversationId, orgId, isDeleted: false, ...EXCLUDE_AGENT },
+        userId,
+      );
+    } catch (error) {
+      if (!next) throw error;
+      return next(error);
     }
 
     // Helper function that contains the common conversation operations
@@ -1359,9 +1373,9 @@ export const addMessageStream =
       const conversation = await ChatSession.findOne({
         _id: conversationId,
         orgId,
-        userId,
         isDeleted: false,
         ...EXCLUDE_AGENT,
+        ...ownerOrWriterFilter(userId),
       });
 
       if (!conversation) {
@@ -1401,6 +1415,7 @@ export const addMessageStream =
           ),
         ],
         session,
+        String(userId),
       );
       conversation.lastActivityAt = Date.now();
 
@@ -1458,9 +1473,9 @@ export const addMessageStream =
       reservation = await reserveRun({
         _id: conversationId,
         orgId,
-        userId,
         isDeleted: false,
         ...EXCLUDE_AGENT,
+        ...ownerOrWriterFilter(userId),
       });
 
       // Get existing conversation and add user message
@@ -1480,15 +1495,16 @@ export const addMessageStream =
       const confirmedConversation = existingConversation as IChatSessionDocument;
 
       // Format previous conversations for context (excluding the user message we just added)
-      // A write-shared viewer's model history is redacted for them like any other
-      // view of the author's messages, or the model could repeat hidden content.
-      const isAuthor =
-        confirmedConversation.initiator?.toString() === String(userId);
+      // The model history is redacted for the requester like any view of other
+      // users' turns, or the model could repeat content they cannot read.
       const allMessagesSoFar = (await redactMessagesFor(
         appConfig,
         await getMessages(
           confirmedConversation._id as mongoose.Types.ObjectId,
-          { orgId: confirmedConversation.orgId, populateCitations: !isAuthor },
+          {
+            orgId: confirmedConversation.orgId,
+            populateCitations: !!confirmedConversation.isShared,
+          },
           session,
         ),
         confirmedConversation.initiator?.toString(),
@@ -1498,9 +1514,11 @@ export const addMessageStream =
         allMessagesSoFar.slice(0, -1),
       );
 
+      // The requester's project access, not the owner's: instructions and scope
+      // apply only to someone who may use the project.
       const followUpProject = await loadProjectForSession(
         confirmedConversation.orgId.toString(),
-        (confirmedConversation.userId as unknown as Types.ObjectId).toString(),
+        String(userId),
         confirmedConversation.projectId,
       );
       const aiRequest = buildAiChatRequest({ kind: 'assistant' }, req.body, {
@@ -1545,7 +1563,10 @@ export const addMessageStream =
           existingConversation,
           contentAccumulator.getText(),
           null,
-          { parts: contentAccumulator.getParts() },
+          {
+            parts: contentAccumulator.getParts(),
+            authorUserId: String(userId),
+          },
         ).catch((err: any) => {
           logger.error('Failed to save partial conversation on disconnect', {
             requestId,
@@ -1764,6 +1785,7 @@ export const addMessageStream =
                     existingConversation.orgId,
                     [toolCallMessage as unknown as IMessage],
                     session,
+                    String(userId),
                   ).catch((saveErr: any) => {
                     logger.error('Failed to persist ask_user_question tool_call message', {
                       requestId,
@@ -1798,6 +1820,7 @@ export const addMessageStream =
                     existingConversation.orgId,
                     [toolCallMessage as unknown as IMessage],
                     session,
+                    String(userId),
                   ).catch((saveErr: any) => {
                     logger.error('Failed to persist ask_user_question tool_call message', {
                       requestId,
@@ -1864,6 +1887,7 @@ export const addMessageStream =
                   existingConversation.orgId,
                   [aiResponseMessage],
                   session,
+                  String(userId),
                 )
               )[0];
               existingConversation.lastActivityAt = Date.now();
@@ -2583,7 +2607,7 @@ const deleteConversation = async (
 
     const ownerOrWriter: Record<string, unknown>[] = [
       { initiator: userId },
-      { 'sharedWith.userId': userId, 'sharedWith.accessLevel': 'write' },
+      { sharedWith: { $elemMatch: { userId, accessLevel: 'write' } } },
     ];
     const deletable: Record<string, unknown> = {
       _id: conversationId,
@@ -2826,9 +2850,10 @@ const createShareConversationHandler =
       if (unknownId) {
         throw new BadRequestError(`User not found: ${unknownId}`);
       }
+      // A level is set only when the caller named one (a new share defaults to read below).
       const validUsers = recipientIds.map((id) => ({
         userId: new mongoose.Types.ObjectId(id),
-        accessLevel: accessLevel || 'read',
+        accessLevel: accessLevel as 'read' | 'write' | undefined,
       }));
 
       async function performShareConversation(session?: ClientSession | null) {
@@ -2854,11 +2879,15 @@ const createShareConversationHandler =
         for (const newUser of validUsers) {
           const existingUser = existingUserMap.get(newUser.userId.toString());
           if (existingUser) {
-            // Update access level if user already exists
-            existingUser.accessLevel = newUser.accessLevel;
+            // Change the level only when the caller named one
+            if (newUser.accessLevel)
+              existingUser.accessLevel = newUser.accessLevel;
           } else {
-            // Add new user if they don't exist
-            mergedSharedWith.push(newUser);
+            // Add new user if they don't exist (read unless write was asked for)
+            mergedSharedWith.push({
+              ...newUser,
+              accessLevel: newUser.accessLevel || 'read',
+            });
           }
         }
 
@@ -3513,6 +3542,15 @@ async function regenerateAnswersInternal(
         'Can only regenerate the last message in the conversation',
       );
     }
+    // The answer was built from its author's access, so only the author may redo it.
+    const turnAuthor = (
+      lastBot.authorUserId ?? conversation.initiator
+    )?.toString();
+    if (turnAuthor !== String(userId)) {
+      throw new ForbiddenError(
+        'Only the person whose message this answers can regenerate it.',
+      );
+    }
     if (ranApprovedCall(lastBot.parts)) {
       throw new BadRequestError(
         'This reply ran an action you approved. Regenerating it could run that action again, so ask again instead.',
@@ -3668,10 +3706,19 @@ async function regenerateAnswersInternal(
 
     // Format previous conversations up to this message (exclude last bot
     // response and the user query that triggered it)
-    const allMessagesForRegen = (await getMessages(
-      existingConversation._id as mongoose.Types.ObjectId,
-      { orgId: existingConversation.orgId },
-      session,
+    // Redacted for the requester: other users' turns may rest on sources they cannot read.
+    const allMessagesForRegen = (await redactMessagesFor(
+      appConfig,
+      (await getMessages(
+        existingConversation._id as mongoose.Types.ObjectId,
+        {
+          orgId: existingConversation.orgId,
+          populateCitations: !!existingConversation.isShared,
+        },
+        session,
+      )) as Array<Record<string, unknown>>,
+      existingConversation.initiator?.toString(),
+      { userId: String(userId), orgId: String(orgId) },
     )) as Array<IMessage & { _id?: mongoose.Types.ObjectId }>;
     // The turn being regenerated (its user query, its answer, and any
     // `tool_call` rows saved after it) is excluded by position, not by a
@@ -3802,7 +3849,7 @@ async function regenerateAnswersInternal(
     }
     const regenProject = await loadProjectForSession(
       existingConversation.orgId.toString(),
-      (existingConversation.userId as unknown as Types.ObjectId).toString(),
+      String(userId),
       existingConversation.projectId,
     );
     applyProjectScope(aiPayload, regenProject);
@@ -4209,14 +4256,9 @@ export const regenerateAnswers =
       buildQueryFilter: (conversationId, orgId, userId) => ({
         _id: conversationId,
         orgId,
-        userId,
         isDeleted: false,
         ...EXCLUDE_AGENT,
-        $or: [
-          { initiator: userId },
-          { 'sharedWith.userId': userId },
-          { isShared: true },
-        ],
+        ...ownerOrWriterFilter(userId),
       }),
       buildAIEndpoint: (appConfig) =>
         `${appConfig.aiBackend}/api/v1/chat/stream`,
@@ -4247,9 +4289,9 @@ export const cancelConversationStream =
       const conversation = await ChatSession.findOne({
         _id: conversationId,
         orgId,
-        userId,
         isDeleted: false,
         ...EXCLUDE_AGENT,
+        ...ownerOrWriterFilter(userId),
       });
       if (!conversation) {
         throw new NotFoundError('Conversation not found or unauthorized');
@@ -4812,7 +4854,7 @@ export const archiveConversation = async (
         ...EXCLUDE_AGENT,
         $or: [
           { initiator: userId },
-          { 'sharedWith.userId': userId, 'sharedWith.accessLevel': 'write' },
+          { sharedWith: { $elemMatch: { userId, accessLevel: 'write' } } },
         ],
       });
 
@@ -4927,7 +4969,7 @@ export const unarchiveConversation = async (
         ...EXCLUDE_AGENT,
         $or: [
           { initiator: userId },
-          { 'sharedWith.userId': userId, 'sharedWith.accessLevel': 'write' },
+          { sharedWith: { $elemMatch: { userId, accessLevel: 'write' } } },
         ],
       });
 
@@ -7120,7 +7162,11 @@ export const streamAgentConversationInternal =
 
 export const addMessageStreamToAgentConversation =
   (appConfig: AppConfig) =>
-  async (req: AuthenticatedUserRequest | AuthenticatedServiceRequest, res: Response) => {
+  async (
+    req: AuthenticatedUserRequest | AuthenticatedServiceRequest,
+    res: Response,
+    next?: NextFunction,
+  ) => {
     const requestId = req.context?.requestId;
     const startTime = Date.now();
     let userId: Types.ObjectId | undefined;
@@ -7153,8 +7199,23 @@ export const addMessageStreamToAgentConversation =
       req.query as Record<string, unknown>,
     );
 
-    if (!req.body.query) {
-      throw new BadRequestError('Query is required');
+    try {
+      if (!req.body.query) {
+        throw new BadRequestError('Query is required');
+      }
+      await assertNotReadOnlyViewer(
+        {
+          _id: conversationId,
+          agentKey,
+          orgId,
+          isDeleted: false,
+          ...ONLY_AGENT,
+        },
+        userId,
+      );
+    } catch (error) {
+      if (!next) throw error;
+      return next(error);
     }
 
     // Helper function that contains the common conversation operations
@@ -7166,9 +7227,9 @@ export const addMessageStreamToAgentConversation =
         _id: conversationId,
         agentKey,
         orgId,
-        userId,
         isDeleted: false,
         ...ONLY_AGENT,
+        ...ownerOrWriterFilter(userId),
       });
 
       if (!conversation) {
@@ -7207,6 +7268,7 @@ export const addMessageStreamToAgentConversation =
           ),
         ],
         session,
+        String(userId),
       );
       conversation.lastActivityAt = Date.now();
 
@@ -7267,9 +7329,9 @@ export const addMessageStreamToAgentConversation =
         _id: conversationId,
         agentKey,
         orgId,
-        userId,
         isDeleted: false,
         ...ONLY_AGENT,
+        ...ownerOrWriterFilter(userId),
       });
 
       // Get existing conversation and add user message
@@ -7289,15 +7351,16 @@ export const addMessageStreamToAgentConversation =
       const confirmedConversation = existingConversation as IChatSessionDocument;
 
       // Format previous conversations for context (excluding the user message we just added)
-      // A write-shared viewer's model history is redacted for them like any other
-      // view of the author's messages, or the model could repeat hidden content.
-      const isAuthor =
-        confirmedConversation.initiator?.toString() === String(userId);
+      // The model history is redacted for the requester like any view of other
+      // users' turns, or the model could repeat content they cannot read.
       const allMessagesSoFar = (await redactMessagesFor(
         appConfig,
         await getMessages(
           confirmedConversation._id as mongoose.Types.ObjectId,
-          { orgId: confirmedConversation.orgId, populateCitations: !isAuthor },
+          {
+            orgId: confirmedConversation.orgId,
+            populateCitations: !!confirmedConversation.isShared,
+          },
           session,
         ),
         confirmedConversation.initiator?.toString(),
@@ -7309,7 +7372,7 @@ export const addMessageStreamToAgentConversation =
 
       const followUpProject = await loadProjectForSession(
         confirmedConversation.orgId.toString(),
-        (confirmedConversation.userId as unknown as Types.ObjectId).toString(),
+        String(userId),
         confirmedConversation.projectId,
       );
       const aiRequest = buildAiChatRequest({ kind: 'agent', agentKey: agentKey as string }, req.body, {
@@ -7354,7 +7417,10 @@ export const addMessageStreamToAgentConversation =
           existingConversation,
           contentAccumulator.getText(),
           null,
-          { parts: contentAccumulator.getParts() },
+          {
+            parts: contentAccumulator.getParts(),
+            authorUserId: String(userId),
+          },
         ).catch((err: any) => {
           logger.error('Failed to save partial conversation on disconnect', {
             requestId,
@@ -7491,6 +7557,7 @@ export const addMessageStreamToAgentConversation =
                     existingConversation.orgId,
                     [toolCallMessage as unknown as IMessage],
                     session,
+                    String(userId),
                   ).catch((saveErr: any) => {
                     logger.error('Failed to persist ask_user_question tool_call message', {
                       requestId,
@@ -7606,6 +7673,7 @@ export const addMessageStreamToAgentConversation =
                     existingConversation.orgId,
                     [toolCallMessage as unknown as IMessage],
                     session,
+                    String(userId),
                   ).catch((saveErr: any) => {
                     logger.error('Failed to persist ask_user_question tool_call message', {
                       requestId,
@@ -7672,6 +7740,7 @@ export const addMessageStreamToAgentConversation =
                   existingConversation.orgId,
                   [aiResponseMessage],
                   session,
+                  String(userId),
                 )
               )[0];
               existingConversation.lastActivityAt = Date.now();
@@ -7913,11 +7982,9 @@ export const regenerateAgentAnswers =
         _id: conversationId,
         agentKey,
         orgId,
-        userId,
-        // Owner only: a chat shared with someone is read-only for them.
-        initiator: userId,
         isDeleted: false,
         ...ONLY_AGENT,
+        ...ownerOrWriterFilter(userId),
       }),
       buildAIEndpoint: (appConfig, agentKey) =>
         `${appConfig.aiBackend}/api/v1/agent/${encodeURIComponent(agentKey as string)}/chat/stream`,
@@ -7946,6 +8013,9 @@ export const cancelAgentConversationStream =
         userId as string,
         agentKey as string,
         conversationId as string,
+        undefined,
+        undefined,
+        'write',
       );
       const conversation = await ChatSession.findOne(filter);
       if (!conversation) {
@@ -8172,7 +8242,7 @@ const getAgentConversationByIdOf = async (
       conversationId as string,
       contentMatchIds,
       accessibleProjectIds,
-      true,
+      'read',
     );
 
     // Build message filter
@@ -8369,6 +8439,12 @@ const deleteAgentConversationOf = async (
     const userId = req.user?.userId;
     const orgId = req.user?.orgId;
 
+    // Missing or foreign ids stay an idempotent 200; a read-only sharee is told no.
+    await assertNotReadOnlyViewer(
+      { _id: conversationId, agentKey, orgId, isDeleted: false, ...ONLY_AGENT },
+      userId,
+      'delete it',
+    );
     const conversation = await deleteAgentConversation(
       conversationId as string,
       agentKey as string,

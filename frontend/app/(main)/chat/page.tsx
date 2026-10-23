@@ -234,6 +234,9 @@ function ChatContent() {
   const activeSlotIsOwner = useChatStore((s) =>
     s.activeSlotId ? s.slots[s.activeSlotId]?.isOwner ?? null : null
   );
+  const activeSlotCanWrite = useChatStore((s) =>
+    s.activeSlotId ? s.slots[s.activeSlotId]?.canWrite ?? null : null
+  );
   const activeSlotConversationModelInfo = useChatStore((s) =>
     s.activeSlotId ? s.slots[s.activeSlotId]?.conversationModelInfo : undefined
   );
@@ -687,6 +690,7 @@ function ChatContent() {
 
         const messages = detail.messages;
         const isOwner = detail.conversation.access?.isOwner ?? false;
+        const canWrite = isOwner || detail.conversation.access?.accessLevel === 'write';
         const apiPagination = detail.pagination;
         const modelInfo = pickModelInfoFromConversationBundle({
           modelInfo: detail.conversation.modelInfo,
@@ -716,6 +720,7 @@ function ChatContent() {
           hasLoaded: true,
           remoteRunInProgress: detail.conversation.status === 'Inprogress',
           isOwner,
+          canWrite,
           messagePagination: {
             currentPage: apiPagination.page,
             hasOlderMessages: apiPagination.hasNextPage,
@@ -1081,12 +1086,13 @@ function ChatContent() {
   const showInitialLoading =
     conversationId != null && (!activeSlotId || !activeSlotIsInitialized);
 
-  // Hide chat input when viewing a shared conversation the user does not own.
+  // Hide chat input when viewing a shared conversation the user does not own or may not write to.
   // `null` means "not yet known": an existing chat that is still loading must not show the
   // composer, or a recipient sees it until the chat arrives. Otherwise (a new chat, or a chat
   // whose ownership could not be read) it stays visible.
+  // A user the chat is shared with for writing gets it too (`canWrite`), a read-only recipient does not.
   const showChatInput =
-    activeSlotIsOwner !== false &&
+    (activeSlotIsOwner !== false || activeSlotCanWrite === true) &&
     !(activeSlotIsOwner === null && (showInitialLoading || showLoading));
 
   // Search mode: show results view when in search mode with results/in-progress search

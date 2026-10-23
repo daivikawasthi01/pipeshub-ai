@@ -749,6 +749,8 @@
     "sharedChats": "Chats compartidos",
     "sharedBy": "Compartido por {{name}}",
     "agentChat": "Chat de agente",
+    "askedBy": "{{name}} preguntó",
+    "askedByUnknown": "Otro usuario preguntó",
     "noSharedChats": "No hay chats compartidos",
     "yourChats": "Tus chats",
     "noChatsFound": "No se encontraron chats",
@@ -5180,6 +5182,10 @@
         "label": "Puede ver",
         "description": "Solo acceso de lectura"
       }
+    },
+    "chatRoles": {
+      "writer": "Puede ver y enviar mensajes. Sus respuestas usan su propio acceso.",
+      "reader": "Solo puede ver el chat."
     },
     "team": "Equipo",
     "teamsNoRoles": "Los equipos no tienen roles",
