@@ -202,6 +202,7 @@ function ArchivedChatsPageContent() {
           <ArchivedChatsEmptyState />
         ) : (
           <ArchivedChatView
+            conversationId={conversationId}
             conversationTitle={selected?.title ?? ''}
             messages={selected?.messages ?? []}
             isLoading={isLoadingConversation || selected?.id !== conversationId}
