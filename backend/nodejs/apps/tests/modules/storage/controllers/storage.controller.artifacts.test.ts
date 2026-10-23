@@ -10,6 +10,7 @@ import { endpoint as ENDPOINTS_KEY, storageEtcdPaths } from '../../../../src/mod
 import { AuthenticatedServiceRequest } from '../../../../src/libs/middlewares/types'
 import {
   BadRequestError,
+  ConflictError,
   ForbiddenError,
   NotFoundError,
   ServiceUnavailableError,
@@ -22,7 +23,7 @@ const valueAt = (row: Row, key: string): unknown =>
   key.split('.').reduce<any>((v, k) => (v == null ? undefined : v[k]), row)
 
 // Enough of Mongo's filter language for these queries: equality on dotted
-// paths, $or, $in, $exists and $eq.
+// paths, $or, $in, $exists, $eq and $ne.
 const matches = (row: Row, filter: Filter): boolean =>
   Object.entries(filter).every(([key, want]) => {
     if (key === '$or') return (want as Filter[]).some((branch) => matches(row, branch))
@@ -35,6 +36,9 @@ const matches = (row: Row, filter: Filter): boolean =>
     }
     if (want !== null && typeof want === 'object' && '$eq' in want) {
       return String(have) === String((want as { $eq: unknown }).$eq)
+    }
+    if (want !== null && typeof want === 'object' && '$ne' in want) {
+      return String(have) !== String((want as { $ne: unknown }).$ne)
     }
     return String(have) === String(want)
   })
@@ -296,6 +300,53 @@ describe('StorageController artifact sets', () => {
         headers: { Authorization: 'Bearer the-callers-storage-token', 'Content-Type': 'application/octet-stream' },
       })
       expect(rows[0]!.storageVendor).to.equal(StorageVendor.Local)
+    })
+  })
+
+  describe('a revision on another storage, or deleted', () => {
+    it('refuses to presign a revision first written to another storage', async () => {
+      storageType = 'azureBlob'
+      artifactRow()
+
+      const { error } = await run('presignArtifactSet', request({ body: presignBody() }))
+
+      expect(error).to.be.instanceOf(ConflictError)
+      expect(adapter.signObjectUrl.called).to.be.false
+    })
+
+    it('refuses read URLs for a revision on another storage', async () => {
+      storageType = 'azureBlob'
+      const doc = artifactRow()
+
+      const { error } = await run(
+        'getArtifactReadUrls',
+        request({ params: { documentId: String(doc._id) }, body: { paths: ['manifest.json'] } }),
+      )
+
+      expect(error).to.be.instanceOf(ConflictError)
+      expect(adapter.signObjectUrl.called).to.be.false
+    })
+
+    it('refuses to presign a deleted revision rather than writing into it', async () => {
+      artifactRow({ isDeleted: true })
+
+      const { error } = await run('presignArtifactSet', request({ body: presignBody() }))
+
+      expect(error).to.be.instanceOf(ConflictError)
+      expect(adapter.signObjectUrl.called).to.be.false
+    })
+
+    it('neither reads nor lists a deleted revision', async () => {
+      const doc = artifactRow({ isDeleted: true })
+
+      const read = await run(
+        'getArtifactReadUrls',
+        request({ params: { documentId: String(doc._id) }, body: { paths: ['manifest.json'] } }),
+      )
+      const list = await run('listArtifactSets', request({ query: { virtualRecordId: VRID } }))
+
+      expect(read.error).to.be.instanceOf(NotFoundError)
+      expect(list.res.body).to.deep.equal({ revisions: [] })
     })
   })
 

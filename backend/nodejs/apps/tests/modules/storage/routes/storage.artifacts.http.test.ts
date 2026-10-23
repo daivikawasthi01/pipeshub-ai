@@ -49,6 +49,9 @@ const matches = (row: Row, filter: Filter): boolean =>
     if (want !== null && typeof want === 'object' && '$eq' in want) {
       return String(have) === String((want as { $eq: unknown }).$eq)
     }
+    if (want !== null && typeof want === 'object' && '$ne' in want) {
+      return String(have) !== String((want as { $ne: unknown }).$ne)
+    }
     return String(have) === String(want)
   })
 

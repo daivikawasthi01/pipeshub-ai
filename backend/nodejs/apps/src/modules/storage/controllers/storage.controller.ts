@@ -729,6 +729,12 @@ export class StorageController {
         rev,
         getStorageVendor(storageType),
       );
+      if (document.isDeleted === true) {
+        throw new ConflictError(
+          'This revision was deleted; purge it before writing it again',
+        );
+      }
+      this.assertArtifactSetOnConfiguredStorage(document, storageType);
       const urls = await this.artifactFileUrls(
         req,
         adapter,
@@ -760,6 +766,7 @@ export class StorageController {
       const document = await this.findArtifactSet(req, orgId);
       const { paths } = req.body as { paths: string[] };
       const storageType = await this.getConfiguredStorageType(req);
+      this.assertArtifactSetOnConfiguredStorage(document, storageType);
       const adapter = await this.remoteArtifactAdapter(req, storageType);
       const urls = await this.artifactFileUrls(
         req,
@@ -824,9 +831,12 @@ export class StorageController {
       const orgId = extractOrgId(req);
       const document = await this.findArtifactSet(req, orgId);
       const adapter = await this.localArtifactAdapter(req);
-      const fullPath = adapter.localObjectPath(
+      const fullPath = await adapter.localObjectPath(
         `${this.artifactRoot(document)}/${String(req.params[0])}`,
       );
+      if (fullPath === null) {
+        throw new NotFoundError('File not found');
+      }
       // The mount itself sits under a dot folder (~/.local), which send would
       // otherwise answer as missing.
       res.sendFile(fullPath, { dotfiles: 'allow' }, (error?: Error) => {
@@ -879,6 +889,7 @@ export class StorageController {
       const documents = await DocumentModel.find({
         orgId,
         'artifactSet.virtualRecordId': { $eq: virtualRecordId },
+        isDeleted: { $ne: true },
       })
         .sort({ createdAt: 1 })
         .select('_id artifactSet storageVendor createdAt updatedAt')
@@ -928,6 +939,21 @@ export class StorageController {
     return root;
   }
 
+  /**
+   * A revision's files live on the storage it was first written to. After a
+   * storage change, writing or reading it on the new one would split it.
+   */
+  private assertArtifactSetOnConfiguredStorage(
+    document: DocumentModel,
+    storageType: string,
+  ): void {
+    if (document.storageVendor !== getStorageVendor(storageType)) {
+      throw new ConflictError(
+        `This revision is stored on ${document.storageVendor}, not on the configured ${storageType} storage`,
+      );
+    }
+  }
+
   private async findArtifactSet(
     req: AuthenticatedServiceRequest,
     orgId: string,
@@ -936,6 +962,7 @@ export class StorageController {
       _id: { $eq: String(req.params.documentId) },
       orgId: toObjectId(orgId, 'organization'),
       artifactSet: { $exists: true },
+      isDeleted: { $ne: true },
     });
     if (!document) {
       throw new NotFoundError('Artifact set not found');
@@ -1307,7 +1334,12 @@ export class StorageController {
       for (const move of moves) {
         const newFullPath = getFullDocumentPath(orgIdText, move.newPath);
         const docs = await DocumentModel.find(
-          virtualRecordDocumentsFilter(orgIdText, orgId, move.virtualRecordId),
+          // A revision's files are keyed by virtual record, not by connector:
+          // they stay where they are when the record changes connector.
+          {
+            ...virtualRecordDocumentsFilter(orgIdText, orgId, move.virtualRecordId),
+            'artifactSet.virtualRecordId': { $exists: false },
+          },
         )
           .select(
             '_id documentPath documentName extension isVersionedFile versionHistory customMetadata',

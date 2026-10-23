@@ -124,17 +124,50 @@ describe('Signed object URLs for artifact sets', () => {
       await a.writeObject(KEY, Buffer.from('first'))
       await a.writeObject(KEY, Buffer.from('second'))
 
-      const full = a.localObjectPath(KEY)
-      expect(full.startsWith(home)).to.be.true
+      const full = (await a.localObjectPath(KEY))!
+      expect(full.startsWith(fs.realpathSync(home))).to.be.true
       expect(fs.readFileSync(full, 'utf8')).to.equal('second')
       // The temporary file the atomic write used is gone.
       expect(fs.readdirSync(path.dirname(full))).to.deep.equal(['part-0000.jsonl'])
     })
 
-    it('refuses a key that would leave the mount', () => {
+    it('refuses a key that would leave the mount', async () => {
       for (const key of ['../escape.json', '/etc/passwd', 'a/../../b']) {
-        expect(() => adapter().localObjectPath(key), key).to.throw(StorageValidationError)
+        try {
+          await adapter().localObjectPath(key)
+          expect.fail(key)
+        } catch (error) {
+          expect(error, key).to.be.instanceOf(StorageValidationError)
+        }
       }
+    })
+
+    it('does not follow a symlinked folder out of the mount, for a write or a read', async () => {
+      const a = adapter()
+      await a.writeObject(KEY, Buffer.from('inside'))
+      const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'artifact-outside-'))
+      try {
+        fs.writeFileSync(path.join(outside, 'part-0000.jsonl'), 'secret')
+        const blocks = path.dirname((await a.localObjectPath(KEY))!)
+        fs.rmSync(blocks, { recursive: true })
+        fs.symlinkSync(outside, blocks)
+
+        for (const attempt of [() => a.writeObject(KEY, Buffer.from('escaped')), () => a.localObjectPath(KEY)]) {
+          try {
+            await attempt()
+            expect.fail('followed the link')
+          } catch (error) {
+            expect(error).to.be.instanceOf(StorageValidationError)
+          }
+        }
+        expect(fs.readFileSync(path.join(outside, 'part-0000.jsonl'), 'utf8')).to.equal('secret')
+      } finally {
+        fs.rmSync(outside, { recursive: true, force: true })
+      }
+    })
+
+    it('answers null for a key whose folder does not exist', async () => {
+      expect(await adapter().localObjectPath('org/PipesHub/records/vr/abcdef12/record.json')).to.equal(null)
     })
   })
 })

@@ -246,12 +246,11 @@ export class StorageServiceAdapter {
         );
   }
 
-  localObjectPath(storageKey: string): string {
-    if (!this.adapter.localObjectPath) {
-      throw new Error(
-        'localObjectPath not implemented for this storage provider',
-      );
-    }
-    return this.adapter.localObjectPath(storageKey);
+  localObjectPath(storageKey: string): Promise<string | null> {
+    return this.adapter.localObjectPath
+      ? this.adapter.localObjectPath(storageKey)
+      : Promise.reject(
+          new Error('localObjectPath not implemented for this storage provider'),
+        );
   }
 }

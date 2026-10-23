@@ -202,8 +202,8 @@ export interface StorageServiceInterface {
   writeObject?(storageKey: string, data: Buffer): Promise<void>;
 
   /**
-   * The absolute filesystem path of a storage key, checked to be inside the
-   * mount. Local only.
+   * Where a storage key really is on disk, symlinks followed, checked to be
+   * inside the mount; null when its folder does not exist. Local only.
    */
-  localObjectPath?(storageKey: string): string;
+  localObjectPath?(storageKey: string): Promise<string | null>;
 }

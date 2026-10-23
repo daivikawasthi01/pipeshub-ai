@@ -465,9 +465,14 @@ class LocalStorageAdapter implements StorageServiceInterface {
 
   async writeObject(storageKey: string, data: Buffer): Promise<void> {
     try {
-      const fullPath = this.localObjectPath(storageKey);
+      const fullPath = this.objectPathInMount(storageKey);
       await fs.mkdir(path.dirname(fullPath), { recursive: true });
-      await this.writeFileAtomically(fullPath, data);
+      // A symlinked folder on the way must not carry the write out of the mount.
+      const located = await this.locateInsideRealMount(fullPath);
+      if (located === null) {
+        throw new StorageNotFoundError('Local folder not found');
+      }
+      await this.writeFileAtomically(located.target, data);
     } catch (error) {
       if (error instanceof StorageError) throw error;
       throw new StorageUploadError('Failed to write object to local storage', {
@@ -476,7 +481,14 @@ class LocalStorageAdapter implements StorageServiceInterface {
     }
   }
 
-  localObjectPath(storageKey: string): string {
+  async localObjectPath(storageKey: string): Promise<string | null> {
+    const located = await this.locateInsideRealMount(
+      this.objectPathInMount(storageKey),
+    );
+    return located === null ? null : located.target;
+  }
+
+  private objectPathInMount(storageKey: string): string {
     return this.assertInsideMount(
       path.join(this.mountPath, this.sanitizePath(storageKey)),
     );
