@@ -152,8 +152,4 @@ class TestNextcloudScenarioMatrix(ConnectorScenarioMatrix):
             "the connector is personal: only its creator reaches the app, and it never reads "
             "Nextcloud share permissions, so a share cannot reach a second PipesHub user"
         ),
-        Action.SET_INDEXING.value: (
-            "the connector declares no indexing filters (no enable_manual_sync), so indexing "
-            "cannot be switched to manual"
-        ),
     }

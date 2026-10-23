@@ -61,6 +61,8 @@ class Node:
     modified: datetime
     content: bytes = b""
     content_type: str = "application/octet-stream"
+    created: int = 0  # nc:creation_time: set only when the uploading client sent one
+    download: bool = True  # False: shared with "Allow download" unticked
 
     @property
     def name(self) -> str:
@@ -116,6 +118,8 @@ class FakeNextcloud:
     filesystem_access: bool = True
     # Mount points whose storage is unavailable (an offline external storage or federated share).
     unavailable: set[str] = field(default_factory=set)
+    # Unavailable mounts their parent's listing leaves out, as the first one after the outage does (seen live).
+    left_out: set[str] = field(default_factory=set)
     # What each host name resolves to: the client connects only to an address it checked.
     dns: dict[str, str] = field(default_factory=lambda: {"cloud.example.com": "93.184.215.14"})
 
@@ -321,6 +325,8 @@ class FakeNextcloud:
                     return httpx.Response(404)
                 if self._blocked(rel) is not None:
                     return httpx.Response(503)
+                if not node.download:
+                    return httpx.Response(403)
                 return httpx.Response(200, content=node.content, headers={"content-type": node.content_type})
         if request.method == "SEARCH" and path.rstrip("/") == "/remote.php/dav":
             return self._search(request.content.decode())
@@ -359,7 +365,7 @@ class FakeNextcloud:
         below = sorted(
             (n for p, n in self.nodes.items()
              if p and p.startswith(prefix) and p != rel and p[len(prefix):].count("/") < depth
-             and (self._blocked(p) in (None, p))),
+             and (self._blocked(p) in (None, p)) and p not in self.left_out),
             key=lambda n: n.path,
         )
         if not self.filesystem_access or mount is not None:
@@ -407,6 +413,9 @@ class FakeNextcloud:
             "<oc:permissions>MG</oc:permissions>" if unopened else "<oc:permissions>RGDNVW</oc:permissions>",
             f"<oc:size>{0 if unopened else self._size(node)}</oc:size>",
             f"<d:displayname>{escape(node.name)}</d:displayname>",
+            f"<nc:creation_time>{node.created}</nc:creation_time>",
+            "<nc:share-attributes>{}</nc:share-attributes>".format(escape(json.dumps(
+                [] if node.download else [{"scope": "permissions", "key": "download", "value": False}]))),
             "<d:resourcetype><d:collection/></d:resourcetype>" if node.is_dir else "<d:resourcetype/>",
         ]
         missing = ["<nc:is-encrypted/>", "<oc:checksums/>"]
@@ -462,7 +471,10 @@ class FakeNextcloud:
         """
         async def handle_async_request(_transport: httpx.AsyncHTTPTransport, request: httpx.Request) -> httpx.Response:
             await request.aread()
-            return self(request)
+            response = self(request)
+            # Nextcloud starts a session on every answer, as the live server does.
+            response.headers["set-cookie"] = "oc_sessionPassphrase=s3ss10n; path=/; HttpOnly"
+            return response
 
         return handle_async_request
 

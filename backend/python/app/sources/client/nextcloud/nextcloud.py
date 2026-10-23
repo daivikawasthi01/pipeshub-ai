@@ -1,4 +1,5 @@
 import base64
+import http.cookiejar
 import logging
 import os
 from dataclasses import asdict, dataclass
@@ -118,6 +119,9 @@ class NextcloudRESTClientViaUsernamePassword(HTTPClient):
                 ),
                 # The guard applies the environment proxy itself; httpx's own would route around it.
                 trust_env=False,
+                # Nextcloud keeps a session's mounts: one whose storage went offline stays 404 for
+                # that session (seen live), where a request without the cookie gets its id -1 entry.
+                cookies=http.cookiejar.CookieJar(policy=http.cookiejar.DefaultCookiePolicy(allowed_domains=[])),
             )
         return self.client
 

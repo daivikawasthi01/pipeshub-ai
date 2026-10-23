@@ -12,6 +12,7 @@ exactly that folder.
 
 from __future__ import annotations
 
+import json
 import os
 import posixpath
 import re
@@ -89,12 +90,16 @@ class NextcloudSourceHelper:
             params={"format": "json"}, auth=self.admin, headers={"OCS-APIRequest": "true"}, timeout=self.timeout,
         )
 
-    def share_with_sync_user(self, owner: tuple[str, str], path: str) -> str:
-        """``owner`` shares their ``path`` with the sync user; returns the share id."""
+    def share_with_sync_user(self, owner: tuple[str, str], path: str, download: bool = True) -> str:
+        """``owner`` shares their ``path`` with the sync user (``download=False``: "Allow download"
+        unticked); returns the share id."""
+        data = {"path": f"/{path.strip('/')}", "shareType": "0", "shareWith": self.user}
+        if not download:
+            data["attributes"] = '[{"scope":"permissions","key":"download","value":false}]'
         response = requests.post(
             f"{self.base_url}/ocs/v2.php/apps/files_sharing/api/v1/shares",
             params={"format": "json"},
-            data={"path": f"/{path.strip('/')}", "shareType": "0", "shareWith": self.user},
+            data=data,
             auth=owner, headers={"OCS-APIRequest": "true"}, timeout=self.timeout,
         )
         response.raise_for_status()
@@ -111,11 +116,9 @@ class NextcloudSourceHelper:
 
         Raises ``ComposeUnavailable`` when neither can be reached, which tests turn into a skip.
         """
-        from helper.compose_control import ComposeStack, ComposeUnavailable
+        from helper.compose_control import ComposeUnavailable
 
-        container = os.getenv("NEXTCLOUD_CONTAINER")
-        if not container:
-            container = ComposeStack.from_env().container_id("nextcloud-source")
+        container = self._container()
         try:
             done = subprocess.run(
                 ["docker", "exec", "-u", "www-data", container, "php", "occ", *args],
@@ -187,6 +190,31 @@ class NextcloudSourceHelper:
             time.sleep(2)
         raise RuntimeError(f"{path} never showed up in the sync user's files")
 
+    def _container(self) -> str:
+        from helper.compose_control import ComposeStack
+
+        return os.getenv("NEXTCLOUD_CONTAINER") or ComposeStack.from_env().container_id("nextcloud-source")
+
+    def connector_address(self, service: str = "pipeshub-ai") -> str:
+        """The address the connector service reaches Nextcloud from, as Nextcloud sees it. Needs ``occ``'s container."""
+        from helper.compose_control import ComposeUnavailable
+
+        try:
+            done = subprocess.run(
+                ["docker", "exec", self._container(), "getent", "hosts", service],
+                capture_output=True, text=True, timeout=30, check=True,
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            raise ComposeUnavailable(f"could not resolve {service} from Nextcloud: {e}") from e
+        return done.stdout.split()[0]
+
+    def failed_logins(self, address: str) -> int:
+        """Failed sign-ins Nextcloud's brute-force protection counts for ``address``."""
+        return int(json.loads(self.occ("security:bruteforce:attempts", address, "--output=json"))["attempts"])
+
+    def reset_failed_logins(self, address: str) -> None:
+        self.occ("security:bruteforce:reset", address)
+
     def take_mount_offline(self, mount_id: str) -> None:
         """Point the mount at a port nothing listens on, as when the server behind it is down."""
         self.occ("files_external:config", mount_id, "host", "http://127.0.0.1:1")
@@ -225,8 +253,10 @@ class NextcloudSourceHelper:
             if response.status_code not in (201, 405):  # 405: it already exists
                 response.raise_for_status()
 
-    def put(self, path: str, content: str, auth: tuple[str, str] | None = None) -> None:
-        """Write ``path`` as the sync user, or as ``auth``'s user (folders above it too)."""
+    def put(self, path: str, content: str, auth: tuple[str, str] | None = None, ctime: int | None = None) -> None:
+        """Write ``path`` as the sync user, or as ``auth``'s user (folders above it too).
+
+        ``ctime`` is the creation time a desktop client sends, in epoch seconds."""
         user, password = auth or (self.user, self.password)
         parts = [p for p in posixpath.dirname(path.strip("/")).split("/") if p]
         for i in range(1, len(parts) + 1):
@@ -236,7 +266,8 @@ class NextcloudSourceHelper:
             if response.status_code not in (201, 405):  # 405: it already exists
                 response.raise_for_status()
         requests.put(
-            self._url(path, user), data=content.encode("utf-8"), auth=(user, password), timeout=self.timeout
+            self._url(path, user), data=content.encode("utf-8"), auth=(user, password), timeout=self.timeout,
+            headers={"X-OC-CTime": str(ctime)} if ctime else None,
         ).raise_for_status()
 
     def copy(self, path: str, new_path: str) -> None:

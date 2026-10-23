@@ -26,6 +26,7 @@ from app.config.constants.arangodb import (
     Connectors,
     MimeTypes,
     OriginTypes,
+    ProgressStatus,
 )
 from app.config.constants.http_status_code import HttpStatusCode
 from app.connectors.core.constants import IconPaths
@@ -63,6 +64,7 @@ from app.connectors.core.registry.connector_builder import (
 from app.connectors.core.registry.filters import (
     FilterCollection,
     FilterOperator,
+    IndexingFilterKey,
     SyncFilterKey,
     load_connector_filters,
 )
@@ -121,6 +123,8 @@ SYNC_PROPERTIES = """
         <oc:fileid />
         <oc:size />
         <d:displayname />
+        <nc:creation_time />
+        <nc:share-attributes />
 """
 
 # Auth settings can't be saved while the connector is on, and only turning it on checks the password.
@@ -361,6 +365,14 @@ def parse_webdav_propfind_response(xml_response: bytes) -> List[Dict]:
                     if permissions_elem is not None:
                         entry['permissions'] = permissions_elem.text
 
+                    creation_elem = prop.find('nc:creation_time', namespaces)
+                    if creation_elem is not None and (creation_elem.text or "").isdigit():
+                        entry['creation_time'] = int(creation_elem.text)
+
+                    attributes_elem = prop.find('nc:share-attributes', namespaces)
+                    if attributes_elem is not None and attributes_elem.text:
+                        entry['download_disabled'] = download_disabled(attributes_elem.text)
+
                     size_elem = prop.find('oc:size', namespaces)
                     if size_elem is not None:
                         entry['size'] = int(size_elem.text) if size_elem.text else 0
@@ -400,6 +412,18 @@ def parse_webdav_propfind_response(xml_response: bytes) -> List[Dict]:
         return []
 
     return entries
+
+
+def download_disabled(share_attributes: str) -> bool:
+    """Whether a share's attributes (JSON) turn download off, as "Allow download" unticked does."""
+    try:
+        attributes = json.loads(share_attributes)
+    except ValueError:
+        return False
+    return isinstance(attributes, list) and any(
+        isinstance(a, dict) and a.get("scope") == "permissions" and a.get("key") == "download" and a.get("value") is False
+        for a in attributes
+    )
 
 
 def is_unreadable(entry: dict) -> bool:
@@ -551,6 +575,7 @@ def nextcloud_reason(response: object) -> str:
         .with_scheduled_config(True, 60)
         .add_filter_field(CommonFields.modified_date_filter("Filter files and folders by modification date."))
         .add_filter_field(CommonFields.file_extension_filter())
+        .add_filter_field(CommonFields.enable_manual_sync_filter())
         .add_sync_custom_field(CommonFields.batch_size_field())
         .with_sync_support(True)
         .with_agent_support(False)
@@ -598,6 +623,11 @@ class NextcloudConnector(BaseConnector):
         self._app_password: Optional[str] = None
         self.batch_size = DEFAULT_BATCH_SIZE
         self.rate_limiter = AsyncLimiter(50, 1)
+        # Nextcloud throttles every request from an address that keeps failing to sign in, and all
+        # connectors share PipesHub's address: after a 401 the password is not sent again. A new one
+        # is saved with the connector off, and turning it on makes a new connector.
+        self.app_password_rejected = False
+        self._remote_wipe_asked = False
         self.sync_filters: FilterCollection = FilterCollection()
         self.indexing_filters: FilterCollection = FilterCollection()
         self._activity_app_missing_noted = False
@@ -698,8 +728,15 @@ class NextcloudConnector(BaseConnector):
         if getattr(response, "status", None) != HttpStatusCode.UNAUTHORIZED.value:
             return
         self.logger.error("❌ Nextcloud rejected the app password (HTTP 401)")
-        if await self._remote_wipe_requested(data_source or self.data_source):
-            await self._wipe_synced_data(data_source or self.data_source)
+        self.app_password_rejected = True
+        await self._app_password_rejected(data_source)
+
+    async def _app_password_rejected(self, data_source: NextcloudDataSource | None = None) -> NoReturn:
+        """Run a remote wipe Nextcloud asks for (asked once per rejected password), tell the user, and raise."""
+        if not self._remote_wipe_asked:
+            self._remote_wipe_asked = True
+            if await self._remote_wipe_requested(data_source or self.data_source):
+                await self._wipe_synced_data(data_source or self.data_source)
         await self.notify(
             type=NotificationType.CONNECTOR_AUTH_ERROR,
             severity=NotificationSeverity.ERROR,
@@ -739,6 +776,7 @@ class NextcloudConnector(BaseConnector):
         """
         self.logger.warning("Nextcloud asked for a remote wipe: removing everything this connector synced")
         removed_all = await self._remove_records_not_listed(set())
+        self._remote_wipe_asked = removed_all
         # A sync with a new app password must list the drive again, not resume the feed.
         await self.activity_sync_point.update_sync_point("activity_cursor", {"cursor": "", "last_full_sync_ms": 0})
         if removed_all:
@@ -938,6 +976,12 @@ class NextcloudConnector(BaseConnector):
             web_url = f"{self.base_url}/index.php/f/{file_id}" if self.base_url and path else ""
 
             is_file = not is_collection
+            # Nextcloud has a creation time only when the uploading client sent one (0 otherwise),
+            # so the first time seen is kept rather than moving to each new modified time.
+            created_ms = entry.get('creation_time', 0) * 1000 or (
+                existing_record.source_created_at if existing_record and existing_record.source_created_at
+                else timestamp_ms
+            )
 
             # Create FileRecord
             file_record = FileRecord(
@@ -952,9 +996,9 @@ class NextcloudConnector(BaseConnector):
                 origin=OriginTypes.CONNECTOR,
                 connector_name=Connectors.NEXTCLOUD,
                 connector_id=self.connector_id,
-                created_at=timestamp_ms,
+                created_at=created_ms,
                 updated_at=timestamp_ms,
-                source_created_at=timestamp_ms,
+                source_created_at=created_ms,
                 source_updated_at=timestamp_ms,
                 weburl=web_url,
                 signed_url=None,
@@ -974,6 +1018,8 @@ class NextcloudConnector(BaseConnector):
                 sha256_hash="",
             )
 
+            if is_file and not self.indexing_filters.is_enabled(IndexingFilterKey.FILES, default=True):
+                file_record.indexing_status = ProgressStatus.AUTO_INDEX_OFF.value
             if file_id:
                 path_to_external_id[clean_path] = file_id
             file_record.inherit_permissions = True
@@ -1091,6 +1137,7 @@ class NextcloudConnector(BaseConnector):
         *,
         rewrite_unchanged: bool = False,
         unread: dict[str, str] | None = None,
+        returned: set[str] | None = None,
     ) -> bool:
         """
         Synchronize all files for a specific user, listing the drive folder by folder.
@@ -1106,6 +1153,8 @@ class NextcloudConnector(BaseConnector):
 
         ``unread`` gathers the folders Nextcloud would not list (path -> why). What is stored
         for them and below them is kept as it is, and counted in ``listed``.
+
+        ``returned`` gathers the IDs of everything the listing returned, filtered out or not.
 
         Returns True only when the drive was listed, apart from ``unread``, and every change saved.
         """
@@ -1123,6 +1172,8 @@ class NextcloudConnector(BaseConnector):
             # 1. Capture the Root Path, e.g. /remote.php/dav/files/NC_Admin
             user_root_path = entries[0].get('path', '').rstrip('/')
             entries = entries[1:]
+            if returned is not None:
+                returned.update(str(e['file_id']) for e in entries if e.get('file_id'))
 
             self.logger.info(f"Found {len(entries)} entries for {user_email}")
 
@@ -1353,12 +1404,17 @@ class NextcloudConnector(BaseConnector):
                 return stored
             after_key = page[-1].id
 
-    async def _remove_records_not_listed(self, listed: set[str]) -> bool:
+    async def _remove_records_not_listed(
+        self, listed: set[str], returned: set[str] | None = None, unread: dict[str, str] | None = None
+    ) -> bool:
         """Delete the records of files and folders a complete listing no longer returns.
 
         After a full sync that read the whole drive, a record the listing did not
         return is a file deleted in Nextcloud or one the sync filters now leave
         out, so it leaves every store. Only called once the drive was read in full.
+        With ``returned`` (every ID the listing held), one Nextcloud left out is removed
+        only once a lookup at its stored path proves it gone; the others, and what is
+        stored below them, are kept and added to ``unread``.
         Returns False when the records could not be read or any delete failed.
         """
         stale: list[Record] = []
@@ -1378,6 +1434,15 @@ class NextcloudConnector(BaseConnector):
             self.logger.error(f"❌ [Full Sync] Could not read the synced records, so none are removed: {e}")
             return False
 
+        if returned is not None and stale:
+            kept = await self._left_out_but_not_gone(
+                [r for r in stale if str(r.external_record_id) not in returned], unread
+            )
+            if kept:
+                self.data_entities_processor.note_kept_records(self.connector_id, [r.id for r in kept])
+                kept_ids = {r.id for r in kept}
+                stale = [r for r in stale if r.id not in kept_ids]
+
         if stale:
             self.logger.info(
                 f"[Full Sync] Removing {len(stale)} record(s) no longer in Nextcloud or in the sync filters"
@@ -1391,6 +1456,64 @@ class NextcloudConnector(BaseConnector):
                 self.logger.warning(f"Failed to remove record {record.external_record_id}: {e}")
         return removed_all
 
+    async def _left_out_but_not_gone(self, missing: list[Record], unread: dict[str, str] | None) -> list[Record]:
+        """Of the records the listing left out, those not proven gone, with everything below them.
+
+        The first listing after a mount's storage goes offline leaves the mount out altogether
+        (seen live, Nextcloud 31), and a search by ID misses it too; only its stored path
+        answers, with file id -1. So the topmost of them is looked up there, and only a 404,
+        or another file in its place, counts as gone.
+        """
+        by_id = {str(r.external_record_id): r for r in missing}
+        kept_top: set[str] = set()
+        for record in missing:
+            if str(record.parent_external_record_id or "") in by_id:
+                continue
+            path, reason = await self._still_at_stored_path(record)
+            if reason:
+                kept_top.add(str(record.external_record_id))
+                self.logger.warning(f"⚠️ [Full Sync] Keeping {path or record.record_name}: {reason}")
+                if unread is not None:
+                    unread[path or record.record_name] = reason
+
+        def below_kept(record: Record) -> bool:
+            seen: set[str] = set()
+            current: Record | None = record
+            while current is not None and str(current.external_record_id) not in seen:
+                if str(current.external_record_id) in kept_top:
+                    return True
+                seen.add(str(current.external_record_id))
+                current = by_id.get(str(current.parent_external_record_id or ""))
+            return False
+
+        return [r for r in missing if below_kept(r)]
+
+    async def _still_at_stored_path(self, record: Record) -> tuple[str, str]:
+        """(its stored path, why it may still be there), with an empty why when Nextcloud proves it gone."""
+        try:
+            path = await self.data_entities_processor.get_record_path(record.id)
+            if not path or (record.parent_external_record_id and "/" not in path.strip("/")):
+                return path or "", "left out of the listing, and its stored path could not be read"
+            async with self.rate_limiter:
+                response = await self.data_source.list_directory(
+                    user_id=self.current_user_id, path=path, depth=0, properties=SYNC_PROPERTIES
+                )
+            if getattr(response, "status", None) == HttpStatusCode.NOT_FOUND.value:
+                return path, ""
+            if not is_response_successful(response):
+                return path, f"left out of the listing, and Nextcloud could not be asked: {get_response_error(response)}"
+            body = extract_response_body(response)
+            entries = parse_webdav_propfind_response(body) if body else []
+            if not entries:
+                return path, "left out of the listing, and Nextcloud's answer could not be read"
+            if is_unreadable(entries[0]):
+                return path, "its storage is not available"
+            if entries[0].get("file_id") != str(record.external_record_id):
+                return path, ""
+            return path, "left out of the listing, but Nextcloud still has it"
+        except Exception as e:
+            return "", f"left out of the listing, and Nextcloud could not be asked: {str(e) or type(e).__name__}"
+
     async def run_sync(self) -> None:
         """
         Smart Sync: Automatically decides between Full vs. Incremental sync based on cursor state.
@@ -1401,6 +1524,8 @@ class NextcloudConnector(BaseConnector):
         """
         try:
             self.logger.info("🔍 [Smart Sync] Starting Nextcloud sync...")
+            if self.app_password_rejected:
+                await self._app_password_rejected()
 
             # Load filters
             self.sync_filters, self.indexing_filters = await load_connector_filters(
@@ -1559,6 +1684,7 @@ class NextcloudConnector(BaseConnector):
             # Sync files for the current user only
             self.logger.info(f"Syncing files for user: {self.current_user_email}")
             unread: dict[str, str] = {}
+            returned: set[str] = set()
             complete = await self._sync_user_files(
                 self.current_user_id,
                 self.current_user_email or self.current_user_id,
@@ -1567,6 +1693,7 @@ class NextcloudConnector(BaseConnector):
                 listed,
                 rewrite_unchanged=rewrite_unchanged,
                 unread=unread,
+                returned=returned,
             )
             if sorted(resave) != before:
                 await self.activity_sync_point.update_sync_point(
@@ -1580,7 +1707,7 @@ class NextcloudConnector(BaseConnector):
                     "so the next sync runs a full sync again."
                 )
 
-            if not await self._remove_records_not_listed(listed):
+            if not await self._remove_records_not_listed(listed, returned, unread):
                 # A filtered-out file is still in Nextcloud, so no later activity would
                 # bring it back; without a cursor the next sync is full and finishes this.
                 raise NextcloudSyncError(
@@ -2002,6 +2129,8 @@ class NextcloudConnector(BaseConnector):
         try:
             async with self.rate_limiter:
                 response = await self.data_source.get_file_by_internal_id(self.current_user_id, file_id)
+            if getattr(response, "status", None) == HttpStatusCode.UNAUTHORIZED.value:
+                self.app_password_rejected = True
             if not is_response_successful(response):
                 self.logger.debug(f"Search by ID failed for {file_id}: {get_response_error(response)}")
                 return None, ""
@@ -2291,7 +2420,7 @@ class NextcloudConnector(BaseConnector):
         """A stored file that no longer passes the sync filters (renamed to an excluded type, say) leaves the index."""
         stored = await self.data_entities_processor.get_record_by_external_id(self.connector_id, str(entry['file_id']))
         if stored is not None:
-            self.logger.info(f"Removing {stored.record_name}: it no longer passes the sync filters")
+            self.logger.info(f"Removing {stored.record_name}: it no longer passes the sync filters or its download was disabled")
             await self.data_entities_processor.on_record_deleted(record_id=stored.id)
 
     async def _save_folder_contents(
@@ -2463,6 +2592,8 @@ class NextcloudConnector(BaseConnector):
         """Stream a file's content for download using authenticated request."""
         if not self.data_source:
             raise connector_not_ready(self.display_name)
+        if self.app_password_rejected:
+            raise map_source_status(HttpStatusCode.UNAUTHORIZED.value, connector=self.display_name)
 
         try:
             file_record = await self.data_entities_processor.get_file_record_by_id(record.id)
@@ -2485,6 +2616,8 @@ class NextcloudConnector(BaseConnector):
 
         try:
             relative_path = await self._current_path(file_record)
+            if self.app_password_rejected:
+                raise map_source_status(HttpStatusCode.UNAUTHORIZED.value, connector=self.display_name)
             if relative_path is None:
                 raise HTTPException(
                     status_code=HttpStatusCode.NOT_FOUND.value,
@@ -2494,6 +2627,8 @@ class NextcloudConnector(BaseConnector):
             response = await self.data_source.open_download(self.current_user_id, relative_path)
             if not HTTP_STATUS_OK <= response.status_code < HTTP_STATUS_MULTIPLE_CHOICES:
                 await response.aclose()
+                if response.status_code == HttpStatusCode.UNAUTHORIZED.value:
+                    self.app_password_rejected = True
                 self.logger.error(f"Failed to download file for record {record.id}: HTTP {response.status_code}")
                 raise map_source_status(response.status_code, connector=self.display_name)
 
@@ -2588,6 +2723,11 @@ class NextcloudConnector(BaseConnector):
         # Only filter files, not folders
         if entry.get('is_collection'):
             return True
+
+        # Nextcloud refuses to send its content (403), and the owner chose that it not leave Nextcloud.
+        if entry.get('download_disabled'):
+            self.logger.debug(f"Skipping {entry.get('display_name')}: shared with download disabled")
+            return False
 
         # Get date filters from cache (performance optimization)
         modified_after, modified_before = self._cached_date_filters

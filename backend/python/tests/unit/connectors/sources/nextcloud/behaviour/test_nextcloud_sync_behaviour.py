@@ -31,7 +31,7 @@ from nextcloud_behaviour_fakes import (
     FakeStore,
 )
 
-from app.config.constants.arangodb import MimeTypes
+from app.config.constants.arangodb import MimeTypes, ProgressStatus
 from app.connectors.core.base.connector.connector_service import ConnectorInitError
 from app.connectors.sources.microsoft.common.msgraph_client import RecordUpdate
 from app.connectors.sources.nextcloud import connector as nextcloud_connector
@@ -2228,6 +2228,30 @@ class TestChecklistAudit:
         assert len(warned) == 1 and "/Mount" in warned[0]["message"]
         assert connector.display_name in warned[0]["title"]
 
+    async def test_a_mount_left_out_of_the_listing_after_an_outage_is_kept(self, server, db, store) -> None:
+        server.add_file("Mount/Deep/inside.txt", b"on the mount")
+        connector = await synced(server, db, store)
+        notifications = listen_for_notifications(connector)
+        server.unavailable.add("Mount")
+        server.left_out.add("Mount")
+        due_for_full_listing(store)
+
+        assert await sync(connector)
+
+        assert {"Mount", "Deep", "inside.txt"} <= db.names(), "left out is not deleted: its path still answers"
+        warned = [n for n in await notifications() if "could not be read" in n["title"]]
+        assert len(warned) == 1 and "Mount" in warned[0]["message"]
+
+    async def test_a_folder_deleted_in_nextcloud_still_leaves_at_the_full_listing(self, server, db, store) -> None:
+        server.add_file("Gone/inside.txt", b"deleted later")
+        connector = await synced(server, db, store)
+        server.delete("Gone")
+        due_for_full_listing(store)
+
+        assert await sync(connector)
+
+        assert not {"Gone", "inside.txt"} & db.names()
+
     async def test_an_unavailable_mount_is_read_again_once_it_is_back(self, server, db, store) -> None:
         server.add_file("Mount/inside.txt", b"on the mount")
         connector = await synced(server, db, store)
@@ -2339,3 +2363,126 @@ class TestChecklistAudit:
         assert "HTTP 503: System in maintenance mode." in text
         assert server.app_password not in text
         assert base64.b64encode(f"{server.user}:{server.app_password}".encode()).decode() not in text
+
+    # ---- created time: Nextcloud has one only when the uploading client sent it ----
+
+    async def test_the_created_time_stays_put_when_a_file_is_edited(self, server, db, store) -> None:
+        connector = await synced(server, db, store)
+        created = db.by_name("readme.txt").source_created_at
+        server.change("readme.txt", b"edited")
+
+        assert await sync(connector)
+
+        record = db.by_name("readme.txt")
+        assert record.source_updated_at > created
+        assert record.source_created_at == record.created_at == created
+
+    async def test_the_creation_time_a_client_sent_is_used(self, server, db, store) -> None:
+        server.add_file("dated.txt").created = 1_600_000_000
+        await synced(server, db, store)
+
+        assert db.by_name("dated.txt").source_created_at == 1_600_000_000_000
+
+    # ---- a file shared with download disabled: Nextcloud lists it but refuses its content ----
+
+    async def test_a_file_shared_with_download_disabled_is_not_synced(self, server, db, store) -> None:
+        server.add_file("Shared/view-only.txt", b"stays in Nextcloud").download = False
+        await synced(server, db, store)
+
+        assert "view-only.txt" not in db.names()
+        assert "Shared" in db.names()
+
+    async def test_a_file_whose_download_is_turned_off_leaves_the_index(self, server, db, store) -> None:
+        server.add_file("Shared/later.txt", b"downloadable at first")
+        connector = await synced(server, db, store)
+        assert "later.txt" in db.names()
+        server.nodes["Shared/later.txt"].download = False
+        due_for_full_listing(store)
+
+        assert await sync(connector)
+
+        assert "later.txt" not in db.names()
+
+    @pytest.mark.parametrize("attributes, disabled", [
+        ('[{"scope":"permissions","key":"download","value":false}]', True),
+        ('[{"scope":"permissions","key":"download","value":true}]', False),
+        ("[]", False),
+        ("not json", False),
+    ])
+    def test_download_disabled_reads_the_share_attributes(self, attributes, disabled) -> None:
+        assert nextcloud_connector.download_disabled(attributes) is disabled
+
+    async def test_no_nextcloud_session_cookie_is_sent_back(self, server, db, store) -> None:
+        """Nextcloud keeps a session's mounts: in a session, an offline mount is a 404 rather than id -1."""
+        await synced(server, db, store)
+
+        assert len(server.requests) > 1
+        assert not [r for r in server.requests if "cookie" in r.headers]
+
+    # ---- a rejected app password is not sent again: Nextcloud throttles the whole address ----
+
+    async def test_after_a_401_neither_sync_nor_preview_sends_the_password_again(self, server, db, store) -> None:
+        connector = await synced(server, db, store)
+        record = db.by_name("readme.txt")
+        server.app_password = "revoked"
+        with pytest.raises(ConnectorInitError, match="rejected the app password"):
+            await connector.run_sync()
+        sent = len(server.requests)
+
+        with pytest.raises(ConnectorInitError, match="rejected the app password"):
+            await connector.run_sync()
+        with pytest.raises(HTTPException) as refused:
+            await connector.stream_record(record)
+
+        assert len(server.requests) == sent, "nothing more reaches Nextcloud with the rejected password"
+        assert refused.value.status_code == 409, "a Nextcloud 401 never signs the user out of PipesHub"
+
+    async def test_a_401_seen_while_streaming_stops_the_next_sync_too(self, server, db, store) -> None:
+        connector = await synced(server, db, store)
+        server.app_password = "revoked"
+        with pytest.raises(HTTPException):
+            await connector.stream_record(db.by_name("readme.txt"))
+        notifications = listen_for_notifications(connector)
+
+        with pytest.raises(ConnectorInitError, match="rejected the app password"):
+            await connector.run_sync()
+
+        assert [n["type"] for n in await notifications()] == [NotificationType.CONNECTOR_AUTH_ERROR]
+
+    async def test_an_unfinished_remote_wipe_is_asked_again_by_the_next_sync(self, server, db, store) -> None:
+        connector = await synced(server, db, store)
+        server.wipe_requested = True
+        failing = {"once": True}
+
+        async def remove_but_fail_once(record_id: str, *args: Any, **kwargs: Any) -> None:  # noqa: ANN401
+            if failing.pop("once", False):
+                raise RuntimeError("store unavailable")
+            await original(record_id=record_id)
+
+        original = connector.data_entities_processor.on_record_deleted
+        connector.data_entities_processor.on_record_deleted = remove_but_fail_once
+        with pytest.raises(ConnectorInitError, match="remote wipe"):
+            await connector.run_sync()
+        assert db.records and not server.wipe_confirmed
+
+        with pytest.raises(ConnectorInitError, match="remote wipe"):
+            await connector.run_sync()
+
+        assert db.records == {} and server.wipe_confirmed
+
+    # ---- manual indexing ----
+
+    async def test_with_manual_indexing_on_files_are_synced_but_not_indexed(self, server, db, store) -> None:
+        seed_drive(server)
+        manual = {"indexing": {"values": {"enable_manual_sync": {"operator": "is", "type": "boolean", "value": True}}}}
+        connector = await make_connector(server, db, store, config={**auth_config(server), "filters": manual})
+
+        assert await sync(connector)
+
+        files = [r for r in db.records.values() if r.is_file]
+        assert files and {r.indexing_status for r in files} == {ProgressStatus.AUTO_INDEX_OFF.value}
+        assert all(r.indexing_status != ProgressStatus.AUTO_INDEX_OFF.value for r in db.records.values() if not r.is_file)
+
+    def test_the_manual_indexing_switch_is_declared(self) -> None:
+        fields = NextcloudConnector._connector_metadata["config"]["filters"]["indexing"]["schema"]["fields"]
+        assert [f["name"] for f in fields] == ["enable_manual_sync"]
