@@ -27758,6 +27758,11 @@ paths:
                 format: binary
         '206':
           description: The requested byte range of the file.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
         '400':
           description: The document id or path is not valid, or storage is not local.
         '401':

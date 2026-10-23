@@ -335,7 +335,7 @@ describe('Storage Routes', () => {
       ['delete', '/internal/artifacts/:documentId', 'internalPurgeArtifactSet'],
     ]
     const specPath = (route: string) =>
-      `/document${route.replace(':documentId', '{documentId}').replace('*', '{path}')}`
+      `/document${route.replace(':documentId', '{documentId}').replace(/\*/g, '{path}')}`
 
     for (const [method, route, operationId] of artifactRoutes) {
       it(`registers ${method.toUpperCase()} ${route} behind the storage token, documented as ${operationId}`, () => {

@@ -22,7 +22,7 @@ const valueAt = (row: Row, key: string): unknown =>
   key.split('.').reduce<any>((v, k) => (v == null ? undefined : v[k]), row)
 
 // Enough of Mongo's filter language for these queries: equality on dotted
-// paths, $or, $in and $exists.
+// paths, $or, $in, $exists and $eq.
 const matches = (row: Row, filter: Filter): boolean =>
   Object.entries(filter).every(([key, want]) => {
     if (key === '$or') return (want as Filter[]).some((branch) => matches(row, branch))
@@ -32,6 +32,9 @@ const matches = (row: Row, filter: Filter): boolean =>
     }
     if (want !== null && typeof want === 'object' && '$exists' in want) {
       return (have !== undefined) === (want as { $exists: boolean }).$exists
+    }
+    if (want !== null && typeof want === 'object' && '$eq' in want) {
+      return String(have) === String((want as { $eq: unknown }).$eq)
     }
     return String(have) === String(want)
   })

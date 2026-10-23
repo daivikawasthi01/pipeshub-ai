@@ -787,7 +787,8 @@ export class StorageController {
     try {
       const orgId = extractOrgId(req);
       const document = await this.findArtifactSet(req, orgId);
-      if (!Buffer.isBuffer(req.body)) {
+      const body: unknown = req.body;
+      if (!Buffer.isBuffer(body)) {
         throw new BadRequestError(
           'Send the file as the request body with Content-Type application/octet-stream',
         );
@@ -797,7 +798,7 @@ export class StorageController {
       try {
         await adapter.writeObject(
           `${this.artifactRoot(document)}/${path}`,
-          req.body,
+          body,
         );
       } catch (error) {
         this.logger.error('Could not write an artifact file', {
@@ -807,7 +808,7 @@ export class StorageController {
         });
         throw new ServiceUnavailableError(STORAGE_WRITE_FAILED_MESSAGE);
       }
-      res.status(HTTP_STATUS.OK).json({ path, size: req.body.length });
+      res.status(HTTP_STATUS.OK).json({ path, size: body.length });
     } catch (error) {
       next(error);
     }
@@ -871,10 +872,10 @@ export class StorageController {
   ): Promise<void> {
     try {
       const orgId = toObjectId(extractOrgId(req), 'organization');
-      const virtualRecordId = req.query.virtualRecordId as string;
+      const virtualRecordId = String(req.query.virtualRecordId);
       const documents = await DocumentModel.find({
         orgId,
-        'artifactSet.virtualRecordId': virtualRecordId,
+        'artifactSet.virtualRecordId': { $eq: virtualRecordId },
       })
         .sort({ createdAt: 1 })
         .select('_id artifactSet storageVendor createdAt updatedAt')
@@ -929,7 +930,7 @@ export class StorageController {
     orgId: string,
   ): Promise<DocumentModel> {
     const document = await DocumentModel.findOne({
-      _id: req.params.documentId,
+      _id: { $eq: String(req.params.documentId) },
       orgId: toObjectId(orgId, 'organization'),
       artifactSet: { $exists: true },
     });
@@ -949,10 +950,11 @@ export class StorageController {
     const orgObjectId = toObjectId(orgId, 'organization');
     const userId = extractUserId(req);
     const initiatorUserId = userId !== null ? toObjectId(userId, 'user') : null;
+    // $eq: the validated ids are strings, and stay values even if that ever changes.
     const filter = {
       orgId: orgObjectId,
-      'artifactSet.virtualRecordId': virtualRecordId,
-      'artifactSet.rev': rev,
+      'artifactSet.virtualRecordId': { $eq: virtualRecordId },
+      'artifactSet.rev': { $eq: rev },
     };
     const existing = await DocumentModel.findOne(filter);
     if (existing) {
