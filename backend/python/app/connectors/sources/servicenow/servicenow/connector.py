@@ -2582,7 +2582,7 @@ class ServiceNowConnector(BaseConnector):
 
             # Deny rows first: unknown deny must never read as "no deny".
             deny_records = await self._fetch_deny_records(deny_criteria_ids or [])
-            can_records = [r for r in await self._fetch_user_criteria(criteria_ids) if self._criteria_is_active(r)]
+            can_records = self._allow_rows(await self._fetch_user_criteria(criteria_ids))
 
             if not deny_records and not any(self._needs_user_resolution(r) for r in can_records):
                 permission_dicts = []
@@ -2629,7 +2629,7 @@ class ServiceNowConnector(BaseConnector):
 
     async def _effective_users(self, allow_ids: list[str], deny_ids: list[str]) -> set[str]:
         deny_records = await self._fetch_deny_records(deny_ids)
-        can_records = [r for r in await self._fetch_user_criteria(allow_ids) if self._criteria_is_active(r)]
+        can_records = self._allow_rows(await self._fetch_user_criteria(allow_ids))
         return await self._users_allowed_by(can_records, deny_records)
 
     async def _users_to_permissions(self, users: set[str], permission_type: PermissionType) -> list[Permission]:
@@ -2713,13 +2713,31 @@ class ServiceNowConnector(BaseConnector):
     def _criteria_is_active(record: TableAPIRecord) -> bool:
         return str(getattr(record, ServiceNowFields.ACTIVE, "true")).lower() != "false"
 
-    def _deny_reach_unknown(self, record: TableAPIRecord) -> bool:
-        """A script (Advanced), a cost centre, or no field evaluated here: the users matched are unknown."""
+    def _has_unevaluable_condition(self, record: TableAPIRecord) -> bool:
+        """A script (Advanced) or a cost centre: conditions not evaluated here."""
         return (
             str(getattr(record, ServiceNowFields.ADVANCED, "false")).lower() == "true"
             or bool(self._split_ids(getattr(record, ServiceNowFields.COST_CENTER, None)))
-            or not any(self._split_ids(getattr(record, d, None)) for d in self._CRITERIA_DIMENSIONS)
         )
+
+    def _deny_reach_unknown(self, record: TableAPIRecord) -> bool:
+        """An unevaluable condition, or no field evaluated here: the users matched are unknown."""
+        return self._has_unevaluable_condition(record) or not any(
+            self._split_ids(getattr(record, d, None)) for d in self._CRITERIA_DIMENSIONS
+        )
+
+    def _allow_rows(self, records: list[TableAPIRecord]) -> list[TableAPIRecord]:
+        """The active Can Read / Can Contribute rows that may grant. A condition not evaluated here
+        counts as not met: under Match All the row grants nobody, under Match Any only its
+        evaluated fields grant (they are all the evaluation below reads)."""
+        return [
+            r for r in records
+            if self._criteria_is_active(r)
+            and not (
+                str(getattr(r, ServiceNowFields.MATCH_ALL, "false")).lower() == "true"
+                and self._has_unevaluable_condition(r)
+            )
+        ]
 
     def _needs_user_resolution(self, record: TableAPIRecord) -> bool:
         match_all = str(getattr(record, ServiceNowFields.MATCH_ALL, "false")).lower() == "true"
@@ -2788,8 +2806,9 @@ class ServiceNowConnector(BaseConnector):
         So the safe side is taken per set: a deny (Cannot Read) expands child groups (denies more),
         an allow uses direct members only (grants less) unless CRITERIA_ALLOW_INCLUDES_CHILD_GROUPS is
         turned on, which should happen only after checking on a real instance.
-        Roles count direct assignments (no hierarchy flattening). Scripted (advanced) criteria are not
-        evaluated: as a deny they deny everyone (_deny_reach_unknown), as an allow their fields alone count.
+        Roles count direct assignments (no hierarchy flattening). Scripted (advanced) and cost-centre
+        conditions are not evaluated and fail closed: a deny denies everyone (_deny_reach_unknown), an
+        allow counts them as not met (_allow_rows).
         """
         match_all = str(getattr(record, ServiceNowFields.MATCH_ALL, "false")).lower() == "true"
         sources = {

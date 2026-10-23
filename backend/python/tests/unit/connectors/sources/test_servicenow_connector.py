@@ -2231,6 +2231,37 @@ class TestCriteriaDenyAndMatchAll:
         assert {(p.entity_type, p.source_sys_id) for p in perms} == {("GROUP", "g1"), ("GROUP", "d1")}
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("unevaluable", [{"advanced": "true"}, {"cost_center": "cc1"}])
+    @pytest.mark.parametrize("fields", [{"group": "g1"}, {"group": "g1", "department": "d1"}])
+    async def test_match_all_with_an_unevaluable_condition_grants_nobody(self, servicenow_connector, unevaluable, fields) -> None:
+        # A script or cost centre is not evaluated, so under Match All the row can never be known to match.
+        self._wire(servicenow_connector, {"c": {"sys_id": "c", "match_all": "true", **fields, **unevaluable}},
+                   {("sys_user_grmember", "g1"): ["u1"], ("sys_user", "d1"): ["u1"]})
+        assert await servicenow_connector._process_criteria_permissions(["c"], PermissionType.READ) == []
+        assert await servicenow_connector._process_criteria_permissions(["c"], PermissionType.WRITE) == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("unevaluable", [{"advanced": "true"}, {"cost_center": "cc1"}])
+    async def test_match_any_with_an_unevaluable_condition_grants_through_the_rest(self, servicenow_connector, unevaluable) -> None:
+        self._wire(servicenow_connector, {"c": {"sys_id": "c", "match_all": "false", "group": "g1", **unevaluable}}, {})
+        perms = await servicenow_connector._process_criteria_permissions(["c"], PermissionType.READ)
+        assert {(p.entity_type, p.source_sys_id) for p in perms} == {("GROUP", "g1")}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("unevaluable", [{"advanced": "true"}, {"cost_center": "cc1"}])
+    async def test_with_a_deny_the_unevaluable_allow_condition_still_fails_closed(self, servicenow_connector, unevaluable) -> None:
+        criteria = {
+            "any": {"sys_id": "any", "match_all": "false", "user": "u1", **unevaluable},
+            "all": {"sys_id": "all", "match_all": "true", "user": "u2", **unevaluable},
+            "d": {"sys_id": "d", "user": "u9"},
+        }
+        self._wire(servicenow_connector, criteria, {})
+        perms = await servicenow_connector._process_criteria_permissions(
+            ["any", "all"], PermissionType.READ, deny_criteria_ids=["d"]
+        )
+        assert self._users(perms) == ["u1"]
+
+    @pytest.mark.asyncio
     async def test_inactive_criteria_grants_nothing(self, servicenow_connector) -> None:
         self._wire(servicenow_connector, {"c": {"sys_id": "c", "active": "false", "user": "u1"}}, {})
         assert await servicenow_connector._process_criteria_permissions(["c"], PermissionType.READ) == []
