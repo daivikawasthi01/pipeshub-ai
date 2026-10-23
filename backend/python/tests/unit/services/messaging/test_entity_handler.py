@@ -14,6 +14,8 @@ from app.config.constants.arangodb import (
     CollectionNames,
     ConnectorScopes,
 )
+from app.connectors.core.base.connector.connector_service import connector_sync_lock
+from app.connectors.core.sync.sync_runner import _run_sync_alone
 from app.services.messaging.kafka.handlers.entity import EntityEventService
 
 # ---------------------------------------------------------------------------
@@ -1648,11 +1650,14 @@ class TestUserAddedConnectorLink:
     async def test_an_add_during_a_pass_gets_one_more_and_never_overlaps(self) -> None:
         running, overlap, calls = 0, 0, 0
 
+        started = asyncio.Event()
+
         async def slow() -> None:
             nonlocal running, overlap, calls
             running += 1
             overlap = max(overlap, running)
             calls += 1
+            started.set()
             await asyncio.sleep(0.1)
             running -= 1
 
@@ -1660,7 +1665,7 @@ class TestUserAddedConnectorLink:
         with patch("app.services.messaging.kafka.handlers.entity._LINK_DEBOUNCE_SEC", 0.02), \
                 patch("app.services.messaging.kafka.handlers.entity.get_coordinator", return_value=None):
             svc._schedule_connector_link("org-1")
-            await asyncio.sleep(0.06)  # first pass in flight
+            await started.wait()  # first pass in flight
             for _ in range(5):
                 svc._schedule_connector_link("org-1")
             await _drain(svc)
@@ -1702,3 +1707,34 @@ class TestUserAddedConnectorLink:
         await _drain(svc)
         c.link_new_users.assert_not_awaited()
         svc.graph_provider.batch_upsert_nodes.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_deferred_while_a_sync_holds_the_connector(self, no_debounce: None) -> None:
+        c = _connector()
+        svc = _link_service({"c1": c})
+        async with connector_sync_lock("c1"):
+            assert await svc._link_connector("c1") is False
+        c.link_new_users.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_sync_admitted_during_a_pass_runs_after_it(self, no_debounce: None) -> None:
+        events: list[str] = []
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def link() -> None:
+            events.append("pass starts")
+            started.set()
+            await release.wait()
+            events.append("pass ends")
+
+        c = _connector(link=link)
+        c.run_sync = AsyncMock(side_effect=lambda: events.append("sync"))
+        svc = _link_service({"c1": c})
+        link_pass = asyncio.create_task(svc._link_connector("c1"))
+        await started.wait()
+        sync = asyncio.create_task(_run_sync_alone(c, "c1"))
+        await asyncio.sleep(0.01)
+        assert events == ["pass starts"]
+        release.set()
+        await asyncio.gather(link_pass, sync)
+        assert events == ["pass starts", "pass ends", "sync"]

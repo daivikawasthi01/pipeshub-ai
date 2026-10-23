@@ -748,7 +748,6 @@ class JiraConnector(BaseConnector):
 
     async def run_sync(self) -> None:
         """Main sync flow: users → groups → projects/roles → issues → deletions."""
-        self._sync_generation += 1  # a link pass that began earlier must not touch this sync's state
         try:
             # 1. Init is done by event_service / setup before run_sync is scheduled
             if not self.data_source:
@@ -1781,20 +1780,14 @@ class JiraConnector(BaseConnector):
         """
         if not self.data_source:
             return
-        with self._keep_sync_state(*self._SYNC_STATE) as still_mine:
+        with self._keep_sync_state(*self._SYNC_STATE):
             self._kept_unread_access = False
             self._kept_after_refusal = []
             jira_users = await self._fetch_users()
             if jira_users:
                 await self.data_entities_processor.on_new_app_users(jira_users)
-            if not still_mine():
-                return
             groups_members_map = await self._sync_user_groups(jira_users)
-            if not still_mine():
-                return
             projects, raw_projects = await self._fetch_filtered_projects(jira_users)
-            if not still_mine():
-                return
             if groups_members_map is not None:
                 await self._sync_project_roles([proj.short_name for proj, _ in projects], jira_users, groups_members_map)
             await self._sync_project_lead_roles(raw_projects, jira_users)

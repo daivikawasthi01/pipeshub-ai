@@ -4180,15 +4180,18 @@ class DataSourceEntitiesProcessor:
     async def note_kept_user_group(self, connector_id: str, external_group_id: str) -> None:
         """Note one stored user group whose members could not be read in full, so its stored
         members stay and the unlink after the full sync in progress, if any, leaves it alone.
+        Every stored copy with that external id is noted, as in finish_full_sync_memberships:
+        older syncs wrote one copy per run, and grants may sit on any of them.
         A lookup that fails raises."""
         if self._full_sync_run(connector_id) is None:
             return
+        groups = CollectionNames.GROUPS.value
         async with self.data_store_provider.transaction() as tx_store:
-            group = await tx_store.get_user_group_by_external_id(
-                connector_id=connector_id, external_id=external_group_id, raise_on_error=True
+            copies = await tx_store.get_nodes_by_filters(
+                groups, {"connectorId": connector_id, "externalGroupId": external_group_id}, raise_on_error=True
             )
-        if group is not None:
-            self._note_full_sync_seen(connector_id, CollectionNames.GROUPS.value, group.id)
+        for doc in copies or []:
+            self._note_full_sync_seen(connector_id, groups, doc.get("_key") or doc.get("id"))
 
     async def note_kept_record_group(self, connector_id: str, external_group_id: str) -> None:
         """Note a record group a connector keeps as stored without writing it as seen by the

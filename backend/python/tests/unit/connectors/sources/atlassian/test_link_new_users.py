@@ -41,7 +41,6 @@ def _jira(cls: type) -> MagicMock:
     c = MagicMock()
     c._keep_sync_state = lambda *names: BaseConnector._keep_sync_state(c, *names)
     c._SYNC_STATE = cls._SYNC_STATE
-    c._sync_generation = 0
     c._kept_unread_access = True
     c._kept_after_refusal = [("projects", "")]
     c._user_read_unfinished = True
@@ -94,21 +93,3 @@ async def test_jira_data_center_pass_keeps_the_sync_state() -> None:
     assert (c._kept_unread_access, c._user_read_unfinished) == (True, True)
     assert c._kept_after_refusal == [("projects", "")]
     assert c._dc_name_to_source_id == {"x": "y"}
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(("cls", "method"), [(JiraConnector, "_link_users_groups_and_roles"), (JiraDataCenterConnector, "_link_users_and_groups")])
-async def test_a_sync_starting_mid_pass_keeps_its_state_and_stops_the_pass(cls: type, method: str) -> None:
-    c = _jira(cls)
-
-    async def fetch_while_a_sync_starts() -> list:
-        c._sync_generation += 1  # run_sync begins and sets its own flags
-        c._kept_unread_access = False
-        c._kept_after_refusal = [("sync", "own")]
-        return ["u"]
-
-    c._fetch_users = fetch_while_a_sync_starts
-    await getattr(cls, method)(c)
-    assert c._kept_unread_access is False
-    assert c._kept_after_refusal == [("sync", "own")]
-    c._sync_user_groups.assert_not_awaited()

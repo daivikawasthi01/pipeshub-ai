@@ -123,8 +123,9 @@ from app.connectors.sources.servicenow.servicenow.constants import (
 
 
 
-class _DenyUnreadable(Exception):
-    """A Cannot Read criteria could not be resolved to users; nothing may be granted."""
+class _CriteriaUnreadable(Exception):
+    """A user criteria (Can Read or Cannot Read) could not be read or resolved to users;
+    the grants it governs are left as stored."""
 
 
 @ConnectorBuilder(ServiceNowConnectorMetadata.NAME)\
@@ -1924,17 +1925,17 @@ class ServiceNowConnector(BaseConnector):
                                 PermissionType.READ,
                                 deny_criteria_ids=criteria_map.get(ServiceNowDictKeys.CANNOT_READ, []),
                             )
-                        except (_DenyUnreadable, ServiceNowAPIError) as e:
-                            # Cannot Read unknown: grant nothing for this KB, keep what is stored.
-                            self.logger.error(f"Skipping knowledge base {kb_sys_id}, its deny rules were not read in full: {e}")
+
+                            # Process WRITE permissions using shared method
+                            write_permissions = await self._process_criteria_permissions(
+                                criteria_map[ServiceNowDictKeys.WRITE],
+                                PermissionType.WRITE,
+                            )
+                        except (_CriteriaUnreadable, ServiceNowAPIError) as e:
+                            # Unknown is not empty: write no grants for this KB, keep what is stored.
+                            self.logger.error(f"Skipping knowledge base {kb_sys_id}, its user criteria were not read in full: {e}")
                             await self.data_entities_processor.note_kept_record_group(self.connector_id, kb_sys_id)
                             continue
-
-                        # Process WRITE permissions using shared method
-                        write_permissions = await self._process_criteria_permissions(
-                            criteria_map[ServiceNowDictKeys.WRITE],
-                            PermissionType.WRITE,
-                        )
 
                         # Combine all permissions
                         permission_objects = read_permissions + write_permissions
@@ -2116,90 +2117,99 @@ class ServiceNowConnector(BaseConnector):
 
             # Pagination variables
             batch_size = ServiceNowDefaults.BATCH_SIZE
-            offset = ServiceNowDefaults.PAGINATION_OFFSET
             total_articles_synced = 0
             total_attachments_synced = 0
             total_records_dropped = 0
             latest_update_time = None
 
-            # Paginate through all articles
-            while True:
-                # Fetch batch of 100 articles
-                datasource = await self._get_fresh_datasource()
-                try:
-                    response = await datasource.get_now_table_tableName(
-                        tableName=ServiceNowTables.KB_KNOWLEDGE,
-                        sysparm_query=query,
-                        sysparm_fields=CommonStrings.COMMA.join(
-                            [
-                                ServiceNowFields.SYS_ID,
-                                ServiceNowFields.NUMBER,
-                                ServiceNowFields.SHORT_DESCRIPTION,
-                                ServiceNowFields.TEXT,
-                                ServiceNowFields.AUTHOR,
-                                ServiceNowFields.KB_KNOWLEDGE_BASE,
-                                ServiceNowFields.KB_CATEGORY,
-                                ServiceNowFields.WORKFLOW_STATE,
-                                ServiceNowFields.ACTIVE,
-                                ServiceNowFields.PUBLISHED,
-                                ServiceNowFields.CAN_READ_USER_CRITERIA,
-                                ServiceNowFields.CANNOT_READ_USER_CRITERIA,
-                                ServiceNowFields.SYS_CREATED_ON,
-                                ServiceNowFields.SYS_UPDATED_ON,
-                            ]
-                        ),
-                        sysparm_limit=str(batch_size),
-                        sysparm_offset=str(offset),
-                        sysparm_display_value=ServiceNowQueryValues.DISPLAY_VALUE_FALSE,
-                        sysparm_no_count=ServiceNowQueryValues.NO_COUNT_TRUE,
-                        sysparm_exclude_reference_link=ServiceNowQueryValues.EXCLUDE_REFERENCE_LINK_TRUE,
-                    )
-                    
-                except ServiceNowAPIError as e:
-                    # A short list is indistinguishable from a complete one to
-                    # everything downstream, so the sync would report success over
-                    # whatever this page did not return.
-                    self.logger.error(f"❌ API error at offset {offset}: {e.message} (status: {e.status_code})")
-                    raise
-
-                # Extract articles from response
-                articles_data = response.result
-
-                if not articles_data:
-                    break
-
-                # Track the latest update timestamp for checkpoint
-                if articles_data:
-                    latest_update_time = articles_data[-1].sys_updated_on
-
-                # Collect RecordUpdates for this batch
-                record_updates = []
-
-                for article_data in articles_data:
+            # Cannot Read is resolved to users here, so whom it denies changes without the article
+            # changing: articles that have it are re-read every run, not only when updated.
+            queries = [query]
+            if last_sync_time:
+                queries.append(
+                    f"{ServiceNowFields.ACTIVE}=true^{ServiceNowFields.WORKFLOW_STATE}={ServiceNowFields.PUBLISHED}"
+                    f"^{ServiceNowFields.CANNOT_READ_USER_CRITERIA}ISNOTEMPTY"
+                    f"^{ServiceNowFields.SYS_UPDATED_ON}<={last_sync_time}^{ServiceNowQueryValues.ORDER_BY_UPDATED}"
+                )
+            for query in queries:
+                # Paginate through all articles
+                offset = ServiceNowDefaults.PAGINATION_OFFSET
+                while True:
+                    # Fetch batch of 100 articles
+                    datasource = await self._get_fresh_datasource()
                     try:
-                        updates = await self._process_single_article(article_data)
-                        if updates:
-                            record_updates.extend(updates)
-                            total_articles_synced += 1
-                            # Count attachments
-                            total_attachments_synced += len([u for u in updates if u.record.record_type == RecordType.FILE])
-                    except Exception as e:
-                        article_id = getattr(article_data, 'sys_id', 'unknown')
-                        self.logger.error(f"❌ Failed to process article {article_id}: {e}", exc_info=True)
+                        response = await datasource.get_now_table_tableName(
+                            tableName=ServiceNowTables.KB_KNOWLEDGE,
+                            sysparm_query=query,
+                            sysparm_fields=CommonStrings.COMMA.join(
+                                [
+                                    ServiceNowFields.SYS_ID,
+                                    ServiceNowFields.NUMBER,
+                                    ServiceNowFields.SHORT_DESCRIPTION,
+                                    ServiceNowFields.TEXT,
+                                    ServiceNowFields.AUTHOR,
+                                    ServiceNowFields.KB_KNOWLEDGE_BASE,
+                                    ServiceNowFields.KB_CATEGORY,
+                                    ServiceNowFields.WORKFLOW_STATE,
+                                    ServiceNowFields.ACTIVE,
+                                    ServiceNowFields.PUBLISHED,
+                                    ServiceNowFields.CAN_READ_USER_CRITERIA,
+                                    ServiceNowFields.CANNOT_READ_USER_CRITERIA,
+                                    ServiceNowFields.SYS_CREATED_ON,
+                                    ServiceNowFields.SYS_UPDATED_ON,
+                                ]
+                            ),
+                            sysparm_limit=str(batch_size),
+                            sysparm_offset=str(offset),
+                            sysparm_display_value=ServiceNowQueryValues.DISPLAY_VALUE_FALSE,
+                            sysparm_no_count=ServiceNowQueryValues.NO_COUNT_TRUE,
+                            sysparm_exclude_reference_link=ServiceNowQueryValues.EXCLUDE_REFERENCE_LINK_TRUE,
+                        )
+                    
+                    except ServiceNowAPIError as e:
+                        # A short list is indistinguishable from a complete one to
+                        # everything downstream, so the sync would report success over
+                        # whatever this page did not return.
+                        self.logger.error(f"❌ API error at offset {offset}: {e.message} (status: {e.status_code})")
+                        raise
 
-                # Process batch of RecordUpdates
-                if record_updates:
-                    total_records_dropped += await self._process_record_updates_batch(record_updates)
+                    # Extract articles from response
+                    articles_data = response.result
 
-                # Move to next batch
-                offset += batch_size
+                    if not articles_data:
+                        break
 
-                # If this batch has fewer records than batch_size, we're done
-                if len(articles_data) < batch_size:
-                    break
+                    # Track the latest update timestamp for checkpoint (the re-read pass is older)
+                    latest_update_time = max(latest_update_time or "", articles_data[-1].sys_updated_on or "")
+
+                    # Collect RecordUpdates for this batch
+                    record_updates = []
+
+                    for article_data in articles_data:
+                        try:
+                            updates = await self._process_single_article(article_data)
+                            if updates:
+                                record_updates.extend(updates)
+                                total_articles_synced += 1
+                                # Count attachments
+                                total_attachments_synced += len([u for u in updates if u.record.record_type == RecordType.FILE])
+                        except Exception as e:
+                            article_id = getattr(article_data, 'sys_id', 'unknown')
+                            self.logger.error(f"❌ Failed to process article {article_id}: {e}", exc_info=True)
+
+                    # Process batch of RecordUpdates
+                    if record_updates:
+                        total_records_dropped += await self._process_record_updates_batch(record_updates)
+
+                    # Move to next batch
+                    offset += batch_size
+
+                    # If this batch has fewer records than batch_size, we're done
+                    if len(articles_data) < batch_size:
+                        break
 
             # Update sync checkpoint
-            if latest_update_time:
+            if latest_update_time and (not last_sync_time or latest_update_time > last_sync_time):
                 await self.article_sync_point.update_sync_point(ServiceNowSyncPointKeys.ARTICLES, {ServiceNowSyncPointKeys.LAST_SYNC_TIME: latest_update_time})
 
             self.logger.info(
@@ -2250,6 +2260,9 @@ class ServiceNowConnector(BaseConnector):
             deny_ids = self._split_ids(getattr(article_data, ServiceNowFields.CANNOT_READ_USER_CRITERIA, None))
             if deny_ids:
                 all_permission_objects = await self._article_deny_permissions(article_data, criteria_ids, deny_ids)
+                # The list is complete and read every run, so it replaces the stored grants: a user
+                # Cannot Read now denies loses the grant an earlier run wrote.
+                article_record.rewrite_permissions = True
             else:
                 all_permission_objects = await self._process_criteria_permissions(criteria_ids, PermissionType.READ)
 
@@ -2292,6 +2305,7 @@ class ServiceNowConnector(BaseConnector):
                 )
 
                 if att_record:
+                    att_record.rewrite_permissions = article_record.rewrite_permissions
                     # Attachments inherit all permissions from article
                     attachment_update = RecordUpdate(
                         record=att_record,
@@ -2335,8 +2349,9 @@ class ServiceNowConnector(BaseConnector):
             for update in record_updates:
                 if not update.record:
                     continue
-                if update.new_permissions:
-                    records_with_permissions.append((update.record, update.new_permissions))
+                # A rewrite with no grants is written too: it removes the grants stored before.
+                if update.new_permissions or update.record.rewrite_permissions:
+                    records_with_permissions.append((update.record, update.new_permissions or []))
                 else:
                     dropped_external_ids.append(update.external_record_id)
 
@@ -2494,7 +2509,9 @@ class ServiceNowConnector(BaseConnector):
                     if criteria_id:
                         criteria_map[ServiceNowDictKeys.READ].append(criteria_id)
             except ServiceNowAPIError as e:
-                self.logger.warning(f"Failed to fetch READ criteria for KB {kb_sys_id}: {e.message}")
+                # Raise: an empty list would remove every reader of the KB.
+                self.logger.error(f"Failed to fetch READ criteria for KB {kb_sys_id}: {e.message}")
+                raise
 
             # Fetch Cannot Read criteria. A failed read raises: the KB would otherwise be
             # granted to users it denies.
@@ -2530,7 +2547,8 @@ class ServiceNowConnector(BaseConnector):
                     if criteria_id:
                         criteria_map[ServiceNowDictKeys.WRITE].append(criteria_id)
             except ServiceNowAPIError as e:
-                self.logger.warning(f"Failed to fetch WRITE criteria for KB {kb_sys_id}: {e.message}")
+                self.logger.error(f"Failed to fetch WRITE criteria for KB {kb_sys_id}: {e.message}")
+                raise
 
             return criteria_map
 
@@ -2555,7 +2573,8 @@ class ServiceNowConnector(BaseConnector):
         here (allowed minus denied) and granted one by one. ServiceNow docs: a user who
         matches both Can Read and Cannot Read is denied; Match All requires a match in every
         populated field (any one element within a field), not just one field.
-        A failed read grants nothing: unknown is not allowed.
+        A failed read raises _CriteriaUnreadable, so the caller keeps the stored grants:
+        unknown is neither allowed nor empty.
         """
         try:
             if not criteria_ids:
@@ -2576,28 +2595,33 @@ class ServiceNowConnector(BaseConnector):
             users = await self._users_allowed_by(can_records, deny_records)
             return await self._users_to_permissions(users, permission_type)
 
-        except _DenyUnreadable:
+        except _CriteriaUnreadable:
             raise
         except Exception as e:
             self.logger.error(f"Failed to process criteria permissions: {e}", exc_info=True)
-            return []
+            raise _CriteriaUnreadable(str(e)) from e
 
     async def _fetch_deny_records(self, deny_ids: list[str]) -> list[TableAPIRecord]:
-        """Active Cannot Read user_criteria rows. A failed read raises _DenyUnreadable."""
+        """Active Cannot Read user_criteria rows. A failed read raises _CriteriaUnreadable."""
         try:
             return [r for r in await self._fetch_user_criteria(deny_ids) if self._criteria_is_active(r)]
         except Exception as e:
-            raise _DenyUnreadable(str(e)) from e
+            raise _CriteriaUnreadable(str(e)) from e
 
     async def _users_allowed_by(self, can_records: list[TableAPIRecord], deny_records: list[TableAPIRecord]) -> set[str]:
         """Users matching any allow row minus users matching any deny row. A deny that cannot be
-        resolved raises _DenyUnreadable; an allow that cannot be resolved raises too (grants nothing)."""
+        resolved raises _CriteriaUnreadable; an allow that cannot be resolved raises too (grants nothing)."""
+        if any(self._deny_reach_unknown(record) for record in deny_records):
+            # Who a scripted or unevaluable Cannot Read denies is unknown, so it may deny anyone:
+            # nobody is allowed through criteria (privileged readers are added by the callers).
+            self.logger.warning("A Cannot Read criteria cannot be evaluated; denying everyone it may cover")
+            return set()
         denied: set[str] = set()
         for record in deny_records:
             try:
                 denied |= await self._users_matching_criteria(record, deny=True)
             except Exception as e:
-                raise _DenyUnreadable(str(e)) from e
+                raise _CriteriaUnreadable(str(e)) from e
         allowed: set[str] = set()
         for record in can_records:
             allowed |= await self._users_matching_criteria(record)
@@ -2689,6 +2713,14 @@ class ServiceNowConnector(BaseConnector):
     def _criteria_is_active(record: TableAPIRecord) -> bool:
         return str(getattr(record, ServiceNowFields.ACTIVE, "true")).lower() != "false"
 
+    def _deny_reach_unknown(self, record: TableAPIRecord) -> bool:
+        """A script (Advanced), a cost centre, or no field evaluated here: the users matched are unknown."""
+        return (
+            str(getattr(record, ServiceNowFields.ADVANCED, "false")).lower() == "true"
+            or bool(self._split_ids(getattr(record, ServiceNowFields.COST_CENTER, None)))
+            or not any(self._split_ids(getattr(record, d, None)) for d in self._CRITERIA_DIMENSIONS)
+        )
+
     def _needs_user_resolution(self, record: TableAPIRecord) -> bool:
         match_all = str(getattr(record, ServiceNowFields.MATCH_ALL, "false")).lower() == "true"
         populated = [d for d in self._CRITERIA_DIMENSIONS if self._split_ids(getattr(record, d, None))]
@@ -2705,7 +2737,7 @@ class ServiceNowConnector(BaseConnector):
             sysparm_fields=CommonStrings.COMMA.join(
                 [
                     ServiceNowFields.SYS_ID, ServiceNowFields.ACTIVE, ServiceNowFields.MATCH_ALL,
-                    *self._CRITERIA_DIMENSIONS, ServiceNowFields.COST_CENTER,
+                    ServiceNowFields.ADVANCED, *self._CRITERIA_DIMENSIONS, ServiceNowFields.COST_CENTER,
                 ]
             ),
             sysparm_display_value=ServiceNowQueryValues.DISPLAY_VALUE_FALSE,
@@ -2756,7 +2788,8 @@ class ServiceNowConnector(BaseConnector):
         So the safe side is taken per set: a deny (Cannot Read) expands child groups (denies more),
         an allow uses direct members only (grants less) unless CRITERIA_ALLOW_INCLUDES_CHILD_GROUPS is
         turned on, which should happen only after checking on a real instance.
-        Roles count direct assignments (no hierarchy flattening). Scripted (advanced) criteria are not evaluated.
+        Roles count direct assignments (no hierarchy flattening). Scripted (advanced) criteria are not
+        evaluated: as a deny they deny everyone (_deny_reach_unknown), as an allow their fields alone count.
         """
         match_all = str(getattr(record, ServiceNowFields.MATCH_ALL, "false")).lower() == "true"
         sources = {

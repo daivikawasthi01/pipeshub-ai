@@ -14,6 +14,7 @@ from app.config.constants.arangodb import (
     OriginTypes,
     ProgressStatus,
 )
+from app.connectors.core.base.connector.connector_service import connector_sync_lock
 from app.connectors.core.base.data_store.graph_data_store import (
     GraphDataStore,
     ensure_written,
@@ -369,21 +370,26 @@ class EntityEventService(BaseEventService):
     async def _link_connector(self, connector_id: str) -> bool:
         """Best effort: a user added after a connector's last user sync has no edge to it
         until the next sync, so run the connector's own user-link steps (the source alone
-        decides what the user may reach). Not run while the connector syncs (the sync's own
-        bookkeeping stays untouched; the caller retries once it has ended) nor for a connector
-        that is off or being deleted. Returns False only when deferred; never raises.
+        decides what the user may reach). Holds connector_sync_lock for the whole pass, so a
+        sync that is admitted meanwhile waits for it, and is not run while the connector syncs
+        (the caller retries once it has ended) nor for a connector that is off or being
+        deleted. Returns False only when deferred; never raises.
         """
         try:
             connector = getattr(self.app_container, "connectors_map", {}).get(connector_id)
-            coordinator = get_coordinator()
             if connector is None:
                 return True
-            if coordinator is not None and await coordinator.is_running(connector_id):
+            lock = connector_sync_lock(connector_id)
+            if lock.locked():
                 return False
-            app = await self.graph_provider.get_document(connector_id, CollectionNames.APPS.value)
-            if not app or not app.get("isActive", False) or app.get("status") == APP_STATUS_DELETING:
-                return True
-            await connector.link_new_users()
+            async with lock:
+                coordinator = get_coordinator()
+                if coordinator is not None and await coordinator.is_running(connector_id):
+                    return False
+                app = await self.graph_provider.get_document(connector_id, CollectionNames.APPS.value)
+                if not app or not app.get("isActive", False) or app.get("status") == APP_STATUS_DELETING:
+                    return True
+                await connector.link_new_users()
         except Exception as e:
             self.logger.warning("Could not link new users to connector %s: %s", connector_id, e)
         return True

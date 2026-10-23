@@ -66,6 +66,7 @@ from app.connectors.core.base.sync_point.sync_point import (
     generate_record_sync_point_key,
 )
 from app.connectors.core.registry.auth_builder import AuthBuilder, AuthType
+from app.connectors.core.sync.full_sync_coverage import FullSyncCoverage
 from app.connectors.core.registry.connector_builder import (
     AuthField,
     CommonFields,
@@ -662,6 +663,8 @@ class SharePointConnector(BaseConnector):
         # Site group ids (as strings), per site, whose members include Everyone or
         # Everyone except external users. Rebuilt by _sync_user_groups.
         self._org_wide_site_groups: dict[str, set] = {}
+        # A group read this run gave up on part of the source without raising; see full_sync_coverage.
+        self._group_read_skipped = False
         self._reset_permission_caches()
 
         self.tenant_region: str = None
@@ -3424,6 +3427,7 @@ class SharePointConnector(BaseConnector):
                 await self._sync_azure_ad_groups()
             except Exception as groups_error:
                 self.logger.error(f"❌ Error syncing Azure AD Groups with delta: {groups_error}")
+                self._group_read_skipped = True
 
             # Part 2: Sync SharePoint groups
             self.logger.info("Starting SharePoint Site Groups fetch...")
@@ -3644,10 +3648,13 @@ class SharePointConnector(BaseConnector):
                 self.logger.info(f"Completed SharePoint group synchronization - processed {total_groups} groups")
 
             except Exception as outer_error:
-                self.logger.debug(f"Site groups fetch wrapper error: {outer_error}")
+                # The site groups read so far were neither written nor kept.
+                self.logger.error(f"❌ Site groups fetch failed: {outer_error}")
+                self._group_read_skipped = True
 
         except Exception as e:
             self.logger.error(f"❌ Error syncing SharePoint groups: {e}")
+            self._group_read_skipped = True
 
     async def _sync_azure_ad_groups(self) -> None:
         """
@@ -4159,9 +4166,15 @@ class SharePointConnector(BaseConnector):
 
             self.logger.info("✅ Credential successfully reinitialized")
 
+    def full_sync_coverage(self) -> FullSyncCoverage:
+        """A run that skipped a group read after an error neither wrote nor kept those groups,
+        so a full sync then unlinks nothing it did not see."""
+        return FullSyncCoverage(complete=not self._group_read_skipped)
+
     async def run_sync(self) -> None:
         """Main entry point for the SharePoint connector."""
         start_time = datetime.now()
+        self._group_read_skipped = False
 
         # Reset statistics for this sync run
         self.stats = {

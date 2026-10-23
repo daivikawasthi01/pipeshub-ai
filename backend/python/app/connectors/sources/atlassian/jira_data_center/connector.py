@@ -859,7 +859,6 @@ class JiraDataCenterConnector(BaseConnector):
         """
         Run sync of Jira projects and issues - only new/updated tickets
         """
-        self._sync_generation += 1  # a link pass that began earlier must not touch this sync's state
         try:
             if not self.data_source:
                 # ``init()`` returns False (rather than raising) on missing /
@@ -1444,14 +1443,13 @@ class JiraDataCenterConnector(BaseConnector):
         """The sync's user and group steps. Project roles, grants and issue edges wait for the next full sync."""
         if not self.data_source:
             return
-        with self._keep_sync_state(*self._SYNC_STATE) as still_mine:
+        with self._keep_sync_state(*self._SYNC_STATE):
             self._kept_unread_access = False
             self._kept_after_refusal = []
             jira_users = await self._fetch_users()
             if jira_users:
                 await self.data_entities_processor.on_new_app_users(jira_users)
-            if still_mine():
-                await self._sync_user_groups(jira_users)
+            await self._sync_user_groups(jira_users)
 
     async def _fetch_users(self) -> list[AppUser]:
         """

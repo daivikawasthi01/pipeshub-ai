@@ -115,3 +115,27 @@ async def test_a_site_whose_group_list_cannot_be_read_keeps_its_stored_groups(co
 
     assert db.kept_user_groups == [f"{SITE_ID}-7"]
     assert db.user_groups[f"{SITE_ID}-7"] == ["ana@contoso.com"]
+
+
+async def test_a_failed_stored_group_lookup_makes_the_full_sync_incomplete(connector, api, db, monkeypatch) -> None:  # noqa: F811
+    serve_site(api)
+    _serve_empty_groups(api)
+    api.on("GET", f"{SITE_REST}/sitegroups", graph_error(401, "Unauthorized"))
+
+    async def lookup_fails(*_a, **_k) -> Never:
+        raise RuntimeError("graph store down")
+
+    monkeypatch.setattr(db, "get_all_user_groups", lookup_fails)
+    assert connector.full_sync_coverage().complete
+
+    await connector._sync_user_groups()
+
+    assert not connector.full_sync_coverage().complete
+
+
+async def test_site_groups_read_in_full_leave_the_full_sync_complete(connector, api, db) -> None:  # noqa: F811
+    _serve(api, db, {"LoginName": "i:0#.f|membership|ana@contoso.com", "Title": "Ana", "PrincipalType": 1, "Email": "ana@contoso.com"})
+
+    await connector._sync_user_groups()
+
+    assert connector.full_sync_coverage().complete

@@ -1,4 +1,4 @@
-"""A Gmail group whose members cannot be read is recorded as kept."""
+"""A Gmail group whose members cannot be read is recorded as kept; a group of groups is not empty."""
 
 from test_gmail_team_sync_behaviour import ALICE, BOB, Harness, ws  # noqa: F401
 
@@ -27,3 +27,12 @@ async def test_a_group_whose_members_all_lack_an_email_is_noted_as_kept(ws: Harn
     await connector._process_group({"email": "team@example.com", "name": "team"})
 
     assert ws.records.kept_user_groups == ["team@example.com"]
+
+
+async def test_a_group_of_groups_gets_the_nested_members_not_an_empty_list(ws: Harness) -> None:  # noqa: F811
+    ws.directory.add_group("team@example.com", [ALICE, BOB])
+    ws.directory.add_group("all@example.com", ["team@example.com"])
+
+    await ws.sync()
+
+    assert {m.email for m in ws.records.user_groups["all@example.com"][1]} == {ALICE, BOB}

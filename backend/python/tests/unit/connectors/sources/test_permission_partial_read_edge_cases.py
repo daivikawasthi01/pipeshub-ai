@@ -131,7 +131,9 @@ async def test_sn_a_deny_criteria_without_match_all_denies_any_one_field(service
 async def test_sn_an_unreadable_deny_criteria_row_read_raises(servicenow_connector) -> None:  # noqa: F811
     from test_servicenow_connector import TestCriteriaDenyAndMatchAll as T
 
-    from app.connectors.sources.servicenow.servicenow.connector import _DenyUnreadable
+    from app.connectors.sources.servicenow.servicenow.connector import (
+        _CriteriaUnreadable,
+    )
     from app.sources.external.servicenow.models import ServiceNowAPIError
 
     T._wire(servicenow_connector, {"can": {"sys_id": "can", "group": "g"}}, {})
@@ -143,7 +145,7 @@ async def test_sn_an_unreadable_deny_criteria_row_read_raises(servicenow_connect
         return await real(tableName=tableName, sysparm_query=sysparm_query, **kw)
 
     servicenow_connector._get_fresh_datasource.return_value.get_now_table_tableName.side_effect = flaky
-    with pytest.raises(_DenyUnreadable):
+    with pytest.raises(_CriteriaUnreadable):
         await servicenow_connector._process_criteria_permissions(["can"], PermissionType.READ, deny_criteria_ids=["deny"])
 
 

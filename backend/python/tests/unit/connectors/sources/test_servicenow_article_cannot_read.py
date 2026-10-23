@@ -70,3 +70,65 @@ def _kb_row_then(real) -> Callable[..., Awaitable[TableAPIResponse]]:
         return await real(tableName=tableName, **kw)
 
     return table
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("deny", "rewrite"), [("deny1", True), (None, False)])
+async def test_an_article_with_cannot_read_replaces_its_grants_and_its_attachments(servicenow_connector, deny, rewrite) -> None:  # noqa: F811
+    from types import SimpleNamespace
+
+    sc = servicenow_connector
+    article = SimpleNamespace(rewrite_permissions=False, inherit_permissions=not deny,
+                              record_group_type=None, external_record_group_id="kb1")
+    attachment = SimpleNamespace(rewrite_permissions=False)
+    sc._transform_to_article_webpage_record = lambda _: article
+    sc._transform_to_attachment_file_record = lambda *_a, **_k: attachment
+    sc._fetch_attachments_for_article = AsyncMock(return_value=[SimpleNamespace(sys_id="att1")])
+    sc._article_deny_permissions = AsyncMock(return_value=[])
+    sc._process_criteria_permissions = AsyncMock(return_value=[])
+
+    updates = await sc._process_single_article(_art(cannot_read_user_criteria=deny))
+
+    assert [u.record.rewrite_permissions for u in updates] == [rewrite, rewrite]
+
+
+@pytest.mark.asyncio
+async def test_a_rewrite_with_no_grants_is_still_written_so_stored_grants_go(servicenow_connector) -> None:  # noqa: F811
+    from types import SimpleNamespace
+
+    sc = servicenow_connector
+    sc.data_entities_processor.on_new_records = AsyncMock()
+    rewrite = SimpleNamespace(record=SimpleNamespace(rewrite_permissions=True), new_permissions=[], external_record_id="a1")
+    plain = SimpleNamespace(record=SimpleNamespace(rewrite_permissions=False), new_permissions=[], external_record_id="a2")
+
+    assert await sc._process_record_updates_batch([rewrite, plain]) == 1
+
+    sc.data_entities_processor.on_new_records.assert_awaited_once_with([(rewrite.record, [])])
+
+
+@pytest.mark.asyncio
+async def test_articles_with_cannot_read_are_re_read_every_run_without_moving_the_checkpoint_back(servicenow_connector) -> None:  # noqa: F811
+    from test_servicenow_connector import _table_api_response
+
+    sc = servicenow_connector
+    sc.article_sync_point = AsyncMock()
+    sc.article_sync_point.read_sync_point = AsyncMock(return_value={"last_sync_time": "2024-06-01 00:00:00"})
+    sc.article_sync_point.update_sync_point = AsyncMock()
+    queries: list[str] = []
+
+    async def table(tableName, sysparm_query, **_) -> TableAPIResponse:
+        queries.append(sysparm_query)
+        if "ISNOTEMPTY" in sysparm_query:  # the re-read pass: an old article with Cannot Read
+            return _table_api_response([{"sys_id": "old", "sys_updated_on": "2024-01-01 00:00:00"}])
+        return _table_api_response([])
+
+    sc._get_fresh_datasource = AsyncMock(return_value=AsyncMock(get_now_table_tableName=AsyncMock(side_effect=table)))
+    sc._process_single_article = AsyncMock(return_value=[])
+
+    await sc._sync_articles()
+
+    assert len(queries) == 2
+    assert "sys_updated_on>2024-06-01 00:00:00" in queries[0]
+    assert "cannot_read_user_criteriaISNOTEMPTY" in queries[1] and "sys_updated_on<=2024-06-01 00:00:00" in queries[1]
+    assert [c.args[0].sys_id for c in sc._process_single_article.await_args_list] == ["old"]
+    sc.article_sync_point.update_sync_point.assert_not_awaited()

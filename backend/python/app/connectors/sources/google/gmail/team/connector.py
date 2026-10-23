@@ -2197,8 +2197,11 @@ class GoogleGmailTeamConnector(BaseConnector):
             self.logger.debug(f"Fetching members for group: {group.get('name', group_id)}")
             members = await self._fetch_group_members(group_id)
 
-            # Filter to only include user members (skip groups and customers)
-            user_members = [m for m in members if m.get("type") == "USER"]
+            # Filter to only include user members (skip groups and customers); a user reached
+            # both directly and through a nested group is listed once.
+            user_members = list({
+                m.get("id") or m.get("email"): m for m in members if m.get("type") == "USER"
+            }.values())
 
             # Create AppUserGroup object
             group_name = group.get("name", "")
@@ -2264,8 +2267,8 @@ class GoogleGmailTeamConnector(BaseConnector):
 
             # Send to processor
             if app_users or not user_members:
-                # The member read finished (it raises otherwise), so an empty list is real:
-                # write it, so the members of a group that was emptied are replaced.
+                # The member read finished (it raises otherwise) and includes nested groups' members,
+                # so an empty list is real: write it, so the members of a group that was emptied go.
                 await self.data_entities_processor.on_new_user_groups([(user_group, app_users)])
                 self.logger.debug(f"Processed group '{group_name}' with {len(app_users)} members")
             else:
@@ -2293,6 +2296,9 @@ class GoogleGmailTeamConnector(BaseConnector):
             try:
                 result = await self.admin_data_source.members_list(
                     groupKey=group_id,
+                    # Members of nested groups too: they are members of this group in Workspace,
+                    # so a group of groups is not written as empty.
+                    includeDerivedMembership=True,
                     pageToken=page_token,
                     maxResults=200  # Maximum allowed by Google Admin API
                 )

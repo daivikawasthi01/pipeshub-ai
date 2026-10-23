@@ -69,6 +69,7 @@ class ServiceNowFields:
     CAN_READ_USER_CRITERIA = "can_read_user_criteria"
     CANNOT_READ_USER_CRITERIA = "cannot_read_user_criteria"
     MATCH_ALL = "match_all"
+    ADVANCED = "advanced"
     USER_CRITERIA = "user_criteria"
     USER_NAME = "user_name"
     FIRST_NAME = "first_name"

@@ -1,10 +1,11 @@
 from abc import ABC, abstractmethod
 import asyncio
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from contextlib import contextmanager
 import copy
 from logging import Logger
 from typing import Any, Dict, List, Optional
+import weakref
 
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -75,6 +76,19 @@ class ConnectorSyncSkippedError(Exception):
     def __init__(self, code: str, message: str = "") -> None:
         super().__init__(message or code)
         self.code = code
+
+
+# Held by a sync for its whole run and by a user-link pass, so the two never overlap on one
+# connector. Keyed by id, not instance: a connector can be rebuilt between the two.
+_SYNC_LOCKS: "weakref.WeakValueDictionary[str, asyncio.Lock]" = weakref.WeakValueDictionary()
+
+
+def connector_sync_lock(connector_id: str) -> asyncio.Lock:
+    lock = _SYNC_LOCKS.get(connector_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _SYNC_LOCKS[connector_id] = lock
+    return lock
 
 
 class BaseConnector(ABC):
@@ -293,32 +307,22 @@ class BaseConnector(ABC):
     async def link_new_users(self) -> None:
         """Run the user and group steps of the sync, without touching content.
 
-        Called after a user is added, never while this connector syncs. The steps are the
-        sync's own, so the source alone decides what the new user may reach; they must be
-        idempotent.
+        Called after a user is added, holding connector_sync_lock, so never while this
+        connector syncs. The steps are the sync's own, so the source alone decides what the
+        new user may reach; they must be idempotent.
         """
         for step in self.user_link_steps:
             await getattr(self, step)()
 
-    # Bumped by a connector's run_sync when it starts; see _keep_sync_state.
-    _sync_generation: int = 0
-
     @contextmanager
-    def _keep_sync_state(self, *names: str) -> Iterator[Callable[[], bool]]:
-        """Leave the named sync bookkeeping fields as they were once the block ends.
-
-        Yields ``still_mine()``: False once a sync has started since the block began. From
-        then on the fields belong to that sync, so the block stops writing (callers check
-        it between steps) and restores nothing.
-        """
-        generation = self._sync_generation
+    def _keep_sync_state(self, *names: str) -> Iterator[None]:
+        """Leave the named sync bookkeeping fields as they were once the block ends."""
         saved = {name: copy.copy(getattr(self, name)) for name in names}
         try:
-            yield lambda: self._sync_generation == generation
+            yield
         finally:
-            if self._sync_generation == generation:
-                for name, value in saved.items():
-                    setattr(self, name, value)
+            for name, value in saved.items():
+                setattr(self, name, value)
 
     @abstractmethod
     async def cleanup(self) -> None:
