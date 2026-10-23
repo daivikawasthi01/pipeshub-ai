@@ -729,7 +729,7 @@ export class StorageController {
         rev,
         getStorageVendor(storageType),
       );
-      if (document.isDeleted === true) {
+      if (document.isDeleted) {
         throw new ConflictError(
           'This revision was deleted; purge it before writing it again',
         );
@@ -1337,7 +1337,11 @@ export class StorageController {
           // A revision's files are keyed by virtual record, not by connector:
           // they stay where they are when the record changes connector.
           {
-            ...virtualRecordDocumentsFilter(orgIdText, orgId, move.virtualRecordId),
+            ...virtualRecordDocumentsFilter(
+              orgIdText,
+              orgId,
+              move.virtualRecordId,
+            ),
             'artifactSet.virtualRecordId': { $exists: false },
           },
         )
