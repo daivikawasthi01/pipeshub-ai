@@ -97,6 +97,10 @@ class TestNextcloudChecklist:
         """TC-ACTIVITY-BACKLOG: Nextcloud pages its feed at 200 rows; one incremental sync reads every page."""
         connector_id = nextcloud_connector["connector_id"]
         folder = f"{nextcloud_connector['folder']}/backlog-{uuid.uuid4().hex[:6]}"
+        # The folder is synced first: a folder created in the same run is saved with all it
+        # holds, which would hide a feed read only in part.
+        nextcloud_source.put(f"{folder}/first.txt", "The folder exists before the backlog.")
+        await sync_until_names_visible(pipeshub_client, graph_provider, connector_id, ["first.txt"])
         before = await settle_record_baseline(pipeshub_client, graph_provider, connector_id)
         for i in range(BACKLOG_FILES):
             nextcloud_source.put(f"{folder}/note-{i:03d}.txt", f"Backlog note number {i}.")
@@ -105,9 +109,9 @@ class TestNextcloudChecklist:
         await wait_for_sync_completion(pipeshub_client, graph_provider, connector_id, timeout=DEFAULT_SYNC_TIMEOUT_SEC)
 
         after = await graph_provider.count_records(connector_id)
-        assert after == before + BACKLOG_FILES + 1, (
+        assert after == before + BACKLOG_FILES, (
             f"TC-ACTIVITY-BACKLOG: one incremental sync brought {after - before} of "
-            f"{BACKLOG_FILES + 1} new records; the rest of the feed was left for a later run"
+            f"{BACKLOG_FILES} new files; the rest of the feed was left for a later run"
         )
 
     @pytest.mark.order(2)
@@ -185,6 +189,7 @@ class TestNextcloudChecklist:
             for name in files:
                 nextcloud_source.put(f"{folder}/{name}", f"Kept on the mount: {name}.", auth=owner)
             mount_id = nextcloud_source.mount_other_users_files(mount, owner)
+            nextcloud_source.wait_until_listed(f"{mount}/{folder}")
             # A new mount logs no activity; the full listing finds it.
             await _full_sync(pipeshub_client, graph_provider, connector_id)
             await sync_until_names_visible(pipeshub_client, graph_provider, connector_id, [mount, folder, *files])

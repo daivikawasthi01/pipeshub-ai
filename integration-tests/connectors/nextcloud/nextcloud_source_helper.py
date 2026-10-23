@@ -16,6 +16,7 @@ import os
 import posixpath
 import re
 import subprocess
+import time
 from urllib.parse import quote
 from xml.etree import ElementTree
 
@@ -174,6 +175,17 @@ class NextcloudSourceHelper:
         mount_id = created.strip().rsplit(" ", 1)[-1]
         self.occ("files_external:applicable", "--add-user", self.user, mount_id)
         return mount_id
+
+    def wait_until_listed(self, path: str, timeout: float = 60) -> None:
+        """Wait until the sync user's WebDAV listing shows ``path`` (a new mount can take a moment)."""
+        parent = posixpath.dirname(path.strip("/"))
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            response = self._dav("PROPFIND", parent, headers={"Depth": "1"})
+            if response.ok and quote(path.strip("/")) in response.text:
+                return
+            time.sleep(2)
+        raise RuntimeError(f"{path} never showed up in the sync user's files")
 
     def take_mount_offline(self, mount_id: str) -> None:
         """Point the mount at a port nothing listens on, as when the server behind it is down."""
