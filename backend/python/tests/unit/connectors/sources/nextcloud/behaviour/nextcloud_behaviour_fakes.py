@@ -111,6 +111,11 @@ class FakeNextcloud:
     redirect_downloads_to: Optional[str] = None
     # False: the Activity app is disabled, and its endpoint answers 404 as Nextcloud does.
     activity_enabled: bool = True
+    # False: the app password's "Allow filesystem access" is unticked. It still signs in, but the
+    # home lists as an empty folder with file id -1 and files answer 404 (seen live, Nextcloud 31).
+    filesystem_access: bool = True
+    # Mount points whose storage is unavailable (an offline external storage or federated share).
+    unavailable: set[str] = field(default_factory=set)
     # What each host name resolves to: the client connects only to an address it checked.
     dns: dict[str, str] = field(default_factory=lambda: {"cloud.example.com": "93.184.215.14"})
 
@@ -312,8 +317,10 @@ class FakeNextcloud:
                 if self.redirect_downloads_to:
                     return httpx.Response(302, headers={"location": self.redirect_downloads_to})
                 node = self.nodes.get(rel)
-                if node is None or node.is_dir:
+                if node is None or node.is_dir or not self.filesystem_access:
                     return httpx.Response(404)
+                if self._blocked(rel) is not None:
+                    return httpx.Response(503)
                 return httpx.Response(200, content=node.content, headers={"content-type": node.content_type})
         if request.method == "SEARCH" and path.rstrip("/") == "/remote.php/dav":
             return self._search(request.content.decode())
@@ -332,17 +339,31 @@ class FakeNextcloud:
         self.unrouted.append(f"{request.method} {request.url}")
         return httpx.Response(404)
 
+    def _blocked(self, path: str) -> str | None:
+        """The unavailable mount ``path`` is or lies below, if any."""
+        return next((m for m in self.unavailable if path == m or path.startswith(m + "/")), None)
+
     def _propfind(self, rel: str, depth_header: str) -> httpx.Response:
         root = self.nodes.get(rel)
         if root is None:
             return httpx.Response(404, content=b"<d:error xmlns:d='DAV:'/>")
+        mount = self._blocked(rel)
+        if mount is not None and rel != mount:
+            return httpx.Response(503, content=(
+                '<?xml version="1.0" encoding="utf-8"?><d:error xmlns:d="DAV:" xmlns:s="http://sabredav.org/ns">'
+                "<s:exception>Sabre\\DAV\\Exception\\ServiceUnavailable</s:exception>"
+                "<s:message>Storage with mount id 4 is not available</s:message></d:error>"
+            ).encode())
         depth = 10**6 if depth_header == "infinity" else int(depth_header)
         prefix = f"{rel}/" if rel else ""
         below = sorted(
             (n for p, n in self.nodes.items()
-             if p and p.startswith(prefix) and p != rel and p[len(prefix):].count("/") < depth),
+             if p and p.startswith(prefix) and p != rel and p[len(prefix):].count("/") < depth
+             and (self._blocked(p) in (None, p))),
             key=lambda n: n.path,
         )
+        if not self.filesystem_access or mount is not None:
+            below = []
         body = "".join(self._response_xml(n) for n in [root, *below])
         xml = (
             '<?xml version="1.0"?><d:multistatus xmlns:d="DAV:" xmlns:s="http://sabredav.org/ns" '
@@ -377,12 +398,14 @@ class FakeNextcloud:
         href = quote(self.webdav_url_path(node.path))
         if node.is_dir and not href.endswith("/"):
             href += "/"
+        # What Nextcloud answers for a node it cannot open (seen live): id -1, no etag, size 0.
+        unopened = node.path in self.unavailable or (not self.filesystem_access and not node.path)
         found = [
             f"<d:getlastmodified>{node.modified.strftime(HTTP_DATE)}</d:getlastmodified>",
-            f"<d:getetag>&quot;{node.etag}&quot;</d:getetag>",
-            f"<oc:fileid>{node.file_id}</oc:fileid>",
-            "<oc:permissions>RGDNVW</oc:permissions>",
-            f"<oc:size>{self._size(node)}</oc:size>",
+            "<d:getetag>&quot;&quot;</d:getetag>" if unopened else f"<d:getetag>&quot;{node.etag}&quot;</d:getetag>",
+            f"<oc:fileid>{-1 if unopened else node.file_id}</oc:fileid>",
+            "<oc:permissions>MG</oc:permissions>" if unopened else "<oc:permissions>RGDNVW</oc:permissions>",
+            f"<oc:size>{0 if unopened else self._size(node)}</oc:size>",
             f"<d:displayname>{escape(node.name)}</d:displayname>",
             "<d:resourcetype><d:collection/></d:resourcetype>" if node.is_dir else "<d:resourcetype/>",
         ]
@@ -407,7 +430,8 @@ class FakeNextcloud:
         if not self.activities:
             return httpx.Response(204)
         since = int(params["since"]) if "since" in params else None
-        limit = int(params.get("limit", "50"))
+        # Nextcloud's Data::get caps every page at 200, whatever is asked for.
+        limit = min(200, int(params.get("limit", "50")))
         descending = params.get("sort", "desc") == "desc"
         items = sorted(self.activities, key=lambda a: a["activity_id"], reverse=descending)
         if since is not None:

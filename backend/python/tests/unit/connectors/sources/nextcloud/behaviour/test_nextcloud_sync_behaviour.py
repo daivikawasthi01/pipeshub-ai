@@ -38,6 +38,7 @@ from app.connectors.sources.nextcloud import connector as nextcloud_connector
 from app.connectors.sources.nextcloud.connector import (
     MAX_HELD_ATTEMPTS,
     NextcloudConnector,
+    NextcloudNoFilesystemAccessError,
     NextcloudSyncError,
 )
 from app.models.entities import FileRecord
@@ -801,7 +802,7 @@ class TestIncrementalSync:
         assert db.path_of("brief.pdf") == "Projects/2026/Plan/brief.pdf"
         assert db.path_of("Plan") == "Projects/2026/Plan"
         feed = server.calls("GET", ACTIVITY_PATH)[-1].url.params
-        assert (feed["since"], feed["sort"], feed["limit"]) == (cursor, "asc", "500")
+        assert (feed["since"], feed["sort"], feed["limit"]) == (cursor, "asc", "200")
         assert store.cursor() == str(server.latest_activity_id)
         incremental = server.calls("PROPFIND")[4:]  # the full sync listed the root, Docs, Docs/Reports and Photos
         fetched = {(unquote(r.url.path).removeprefix(f"{WEBDAV_PREFIX}alice/"), r.headers["depth"]) for r in incremental}
@@ -935,7 +936,8 @@ class TestIncrementalSync:
 
         assert await sync(connector)
         pages = [r.url.params["since"] for r in server.calls("GET", ACTIVITY_PATH) if "since" in r.url.params]
-        assert pages[-2:] == [str(start), str(start + 500)], "the run reads on past a full page of 500"
+        # Nextcloud answers at most 200 a page, so a full page is shorter than the 500 once asked for.
+        assert pages[-3:] == [str(start), str(start + 200), str(start + 400)], "the run reads every page"
         assert store.cursor() == str(server.latest_activity_id)
         assert "late.txt" in db.names()
         assert db.by_name("notes.txt").external_revision_id == server.nodes["Docs/notes.txt"].etag
@@ -2173,3 +2175,167 @@ class TestReviewFixesPP366:
 
         assert connector.batch_size == 2
         assert max(len(b) for b in db.batches) == 2
+
+
+def due_for_full_listing(store: FakeStore) -> None:
+    store.checkpoint()["last_full_sync_ms"] -= nextcloud_connector.FULL_SYNC_INTERVAL_MS
+
+
+class TestChecklistAudit:
+    """Findings of the connector checklist audit, each failing on the code before its fix."""
+
+    # ---- an app password without filesystem access: the drive looks empty ----
+
+    async def test_an_app_password_without_filesystem_access_removes_nothing(self, server, db, store) -> None:
+        connector = await synced(server, db, store)
+        kept, cursor = db.names(), store.cursor()
+        notifications = listen_for_notifications(connector)
+        server.filesystem_access = False
+        due_for_full_listing(store)
+
+        with pytest.raises(NextcloudNoFilesystemAccessError, match="Allow filesystem access"):
+            await connector.run_sync()
+
+        assert db.names() == kept and db.deleted == [], "an unreadable home is not an empty drive"
+        assert store.cursor() == cursor
+        sent = await notifications()
+        assert [n["type"] for n in sent] == [NotificationType.CONNECTOR_AUTH_ERROR], "told once, with the fix"
+        assert connector.display_name in sent[0]["title"]
+
+    async def test_the_connection_test_refuses_an_app_password_without_filesystem_access(self, server, db, store) -> None:
+        connector = await make_connector(server, db, store)
+        server.filesystem_access = False
+
+        with pytest.raises(NextcloudNoFilesystemAccessError, match="Allow filesystem access"):
+            await connector.test_connection_and_access()
+
+    # ---- a mount whose storage is unavailable: Nextcloud lists it as an empty folder with id -1 ----
+
+    async def test_what_was_synced_from_an_unavailable_mount_is_kept(self, server, db, store) -> None:
+        server.add_file("Mount/Deep/inside.txt", b"on the mount")
+        connector = await synced(server, db, store)
+        notifications = listen_for_notifications(connector)
+        server.unavailable.add("Mount")
+        server.change("readme.txt", b"still synced")
+        due_for_full_listing(store)
+
+        assert await sync(connector)
+
+        assert {"Mount", "Deep", "inside.txt"} <= db.names(), "nothing below the mount is removed"
+        assert "-1" not in db.records, "no record is keyed by Nextcloud's -1"
+        assert db.by_name("readme.txt").external_revision_id == server.nodes["readme.txt"].etag
+        warned = [n for n in await notifications() if "could not be read" in n["title"]]
+        assert len(warned) == 1 and "/Mount" in warned[0]["message"]
+        assert connector.display_name in warned[0]["title"]
+
+    async def test_an_unavailable_mount_is_read_again_once_it_is_back(self, server, db, store) -> None:
+        server.add_file("Mount/inside.txt", b"on the mount")
+        connector = await synced(server, db, store)
+        server.unavailable.add("Mount")
+        due_for_full_listing(store)
+        assert await sync(connector)
+
+        server.unavailable.clear()
+        server.add_file("Mount/later.txt", b"written while it was down", log=False)
+        due_for_full_listing(store)
+        assert await sync(connector)
+
+        assert {"inside.txt", "later.txt"} <= db.names()
+
+    async def test_a_first_sync_skips_an_unavailable_mount_and_saves_the_rest(self, server, db, store) -> None:
+        seed_drive(server)
+        server.add_file("Mount/inside.txt")
+        server.unavailable.add("Mount")
+        connector = await make_connector(server, db, store)
+
+        assert await sync(connector)
+
+        assert {"q1.pdf", "notes.txt", "cat.png", "readme.txt"} <= db.names()
+        assert "-1" not in db.records and "Mount" not in db.names()
+
+    async def test_a_folder_nextcloud_will_not_list_does_not_fail_the_whole_full_sync(self, server, db, store) -> None:
+        connector = await synced(server, db, store)
+        server.change("readme.txt", b"v2")
+        server.outage("PROPFIND", lambda p: p.rstrip("/").endswith("/Docs"), lambda: httpx.Response(500))
+        due_for_full_listing(store)
+
+        assert await sync(connector)
+
+        assert {"Docs", "Reports", "q1.pdf", "notes.txt"} <= db.names(), "what was under it is kept"
+        assert db.by_name("readme.txt").external_revision_id == server.nodes["readme.txt"].etag
+
+    async def test_a_change_inside_an_unavailable_mount_is_held_not_saved_as_minus_one(self, server, db, store) -> None:
+        server.add_file("Mount/inside.txt", b"v1")
+        connector = await synced(server, db, store)
+        server.change("Mount/inside.txt", b"v2")
+        server.unavailable.add("Mount")
+
+        assert not await sync(connector)
+
+        assert "-1" not in db.records
+        assert store.cursor() != str(server.latest_activity_id), "held for the next run"
+
+    # ---- the activity feed: 200 a page, grouped rows ----
+
+    async def test_the_cursor_follows_the_last_row_nextcloud_gave(self, server, db, store) -> None:
+        connector = await synced(server, db, store)
+        server.add_file("one.txt")
+        server.add_file("two.txt")
+        last_row = server.latest_activity_id + 7  # rows Nextcloud grouped into the activities it returned
+        real = server._activity
+
+        def grouped(params: httpx.QueryParams) -> httpx.Response:
+            response = real(params)
+            if response.status_code == 200:
+                response.headers["X-Activity-Last-Given"] = str(last_row)
+            return response
+
+        server._activity = grouped
+        assert await sync(connector)
+
+        assert store.cursor() == str(last_row)
+
+    # ---- a failed sync is reported ----
+
+    async def test_a_sync_that_fails_is_reported_with_nextclouds_reason(self, server, db, store) -> None:
+        seed_drive(server)
+        connector = await make_connector(server, db, store)
+        notifications = listen_for_notifications(connector)
+        server.outage("PROPFIND", lambda p: True, lambda: httpx.Response(503, content=(
+            b'<d:error xmlns:d="DAV:" xmlns:s="http://sabredav.org/ns">'
+            b"<s:message>System in maintenance mode.</s:message></d:error>")))
+
+        with pytest.raises(NextcloudSyncError):
+            await connector.run_sync()
+
+        sent = await notifications()
+        assert [n["type"] for n in sent] == [NotificationType.CONNECTOR_SYNC_ERROR]
+        assert connector.display_name in sent[0]["title"]
+
+    async def test_changes_held_for_a_retry_are_not_reported_as_a_failed_sync(self, server, db, store) -> None:
+        connector = await synced(server, db, store)
+        notifications = listen_for_notifications(connector)
+        server.change("Docs/notes.txt", b"v2")
+        server.outage("PROPFIND", lambda p: p.endswith("/Docs/notes.txt"), lambda: httpx.Response(503))
+
+        assert not await sync(connector)
+
+        assert await notifications() == [], "a retry the next run makes is not a failure to report yet"
+
+    # ---- logs carry Nextcloud's reason, never the app password ----
+
+    async def test_a_failed_listing_logs_nextclouds_reason_and_no_secret(self, server, db, store) -> None:
+        seed_drive(server)
+        connector = await make_connector(server, db, store)
+        logs = capture_logs(connector)
+        server.outage("PROPFIND", lambda p: True, lambda: httpx.Response(503, content=(
+            b'<d:error xmlns:d="DAV:" xmlns:s="http://sabredav.org/ns">'
+            b"<s:message>System in maintenance mode.</s:message></d:error>")))
+
+        with pytest.raises(NextcloudSyncError):
+            await connector.run_sync()
+
+        text = "\n".join(r.getMessage() for r in logs)
+        assert "HTTP 503: System in maintenance mode." in text
+        assert server.app_password not in text
+        assert base64.b64encode(f"{server.user}:{server.app_password}".encode()).decode() not in text

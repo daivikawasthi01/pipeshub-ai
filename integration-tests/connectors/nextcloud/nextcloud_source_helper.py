@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import posixpath
+import re
 import subprocess
 from urllib.parse import quote
 from xml.etree import ElementTree
@@ -21,6 +22,13 @@ from xml.etree import ElementTree
 import requests
 
 _DAV = "{DAV:}"
+
+
+def _request_token(page: str) -> str:
+    found = re.search(r'data-requesttoken="([^"]+)"', page)
+    if not found:
+        raise RuntimeError("Nextcloud page has no request token; the sign-in failed")
+    return found.group(1)
 
 
 class NextcloudSourceHelper:
@@ -115,6 +123,61 @@ class NextcloudSourceHelper:
         except (OSError, subprocess.SubprocessError) as e:
             raise ComposeUnavailable(f"could not run occ in {container}: {e}") from e
         return done.stdout
+
+    def _settings_session(self) -> tuple[requests.Session, dict[str, str]]:
+        """A browser session of the sync user and the CSRF header its settings calls need."""
+        session = requests.Session()
+        session.headers["Origin"] = self.base_url
+        page = session.get(f"{self.base_url}/index.php/login", timeout=self.timeout)
+        page = session.post(
+            f"{self.base_url}/index.php/login",
+            data={"user": self.user, "password": self.password, "requesttoken": _request_token(page.text),
+                  "timezone": "UTC", "timezone_offset": "0"},
+            headers={"Referer": f"{self.base_url}/index.php/login"}, timeout=self.timeout,
+        )
+        page.raise_for_status()
+        return session, {"requesttoken": _request_token(page.text)}
+
+    def create_app_password(self, name: str) -> tuple[str, str]:
+        """A new app password of the sync user, as Personal settings > Security makes one: (password, token id)."""
+        session, csrf = self._settings_session()
+        response = session.post(
+            f"{self.base_url}/index.php/settings/personal/authtokens", json={"name": name},
+            headers=csrf, timeout=self.timeout,
+        )
+        response.raise_for_status()
+        return response.json()["token"], str(response.json()["deviceToken"]["id"])
+
+    def set_filesystem_access(self, token_id: str, name: str, allowed: bool) -> None:
+        """Tick or untick "Allow filesystem access" for one of the sync user's app passwords."""
+        session, csrf = self._settings_session()
+        session.put(
+            f"{self.base_url}/index.php/settings/personal/authtokens/{token_id}",
+            json={"name": name, "scope": {"filesystem": allowed}}, headers=csrf, timeout=self.timeout,
+        ).raise_for_status()
+
+    def delete_app_password(self, token_id: str) -> None:
+        session, csrf = self._settings_session()
+        session.delete(
+            f"{self.base_url}/index.php/settings/personal/authtokens/{token_id}", headers=csrf, timeout=self.timeout,
+        )
+
+    def mount_other_users_files(self, mount_point: str, owner: tuple[str, str]) -> str:
+        """An external WebDAV storage at ``mount_point`` in the sync user's drive, showing ``owner``'s
+        files from this same server; returns the mount id. Needs ``occ``."""
+        self.occ("app:enable", "files_external")
+        created = self.occ(
+            "files_external:create", f"/{mount_point}", "dav", "password::password",
+            "-c", "host=http://localhost", "-c", f"root=remote.php/dav/files/{owner[0]}",
+            "-c", "secure=false", "-c", f"user={owner[0]}", "-c", f"password={owner[1]}",
+        )
+        mount_id = created.strip().rsplit(" ", 1)[-1]
+        self.occ("files_external:applicable", "--add-user", self.user, mount_id)
+        return mount_id
+
+    def take_mount_offline(self, mount_id: str) -> None:
+        """Point the mount at a port nothing listens on, as when the server behind it is down."""
+        self.occ("files_external:config", mount_id, "host", "http://127.0.0.1:1")
 
     def ensure_user(self) -> None:
         """Create the sync user if needed, and give it the configured email."""
