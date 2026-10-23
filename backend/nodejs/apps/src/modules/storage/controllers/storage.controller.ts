@@ -872,7 +872,10 @@ export class StorageController {
   ): Promise<void> {
     try {
       const orgId = toObjectId(extractOrgId(req), 'organization');
-      const virtualRecordId = String(req.query.virtualRecordId);
+      const virtualRecordId = req.query.virtualRecordId;
+      if (typeof virtualRecordId !== 'string') {
+        throw new BadRequestError('virtualRecordId must be a single value');
+      }
       const documents = await DocumentModel.find({
         orgId,
         'artifactSet.virtualRecordId': { $eq: virtualRecordId },
