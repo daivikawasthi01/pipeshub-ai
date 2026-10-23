@@ -808,7 +808,7 @@ export class StorageController {
         });
         throw new ServiceUnavailableError(STORAGE_WRITE_FAILED_MESSAGE);
       }
-      res.status(HTTP_STATUS.OK).json({ path, size: body.length });
+      res.status(HTTP_STATUS.OK).json({ path, size: Buffer.byteLength(body) });
     } catch (error) {
       next(error);
     }
