@@ -589,10 +589,11 @@ export function createAccessRequestRouter(container: Container): Router {
   const router = Router();
   const authMiddleware = container.get<AuthMiddleware>('AuthMiddleware');
   const appConfig = container.get<AppConfig>('AppConfig');
+  const authenticate = authMiddleware.authenticate.bind(authMiddleware);
 
   router.post(
     '/',
-    authMiddleware.authenticate,
+    authenticate,
     requireScopes(OAuthScopeNames.CONVERSATION_READ),
     ValidationMiddleware.validate(createAccessRequestSchema),
     createAccessRequest(appConfig),
@@ -600,14 +601,14 @@ export function createAccessRequestRouter(container: Container): Router {
 
   router.get(
     '/',
-    authMiddleware.authenticate,
+    authenticate,
     requireScopes(OAuthScopeNames.CONVERSATION_READ),
     listIncomingAccessRequests,
   );
 
   router.get(
     '/:requestId',
-    authMiddleware.authenticate,
+    authenticate,
     requireScopes(OAuthScopeNames.CONVERSATION_READ),
     ValidationMiddleware.validate(accessRequestIdParamsSchema),
     getAccessRequest,
@@ -616,7 +617,7 @@ export function createAccessRequestRouter(container: Container): Router {
   for (const decision of ['approve', 'deny'] as const) {
     router.post(
       `/:requestId/${decision}`,
-      authMiddleware.authenticate,
+      authenticate,
       requireScopes(OAuthScopeNames.CONVERSATION_WRITE),
       ValidationMiddleware.validate(accessRequestIdParamsSchema),
       decideAccessRequest(appConfig, decision),
