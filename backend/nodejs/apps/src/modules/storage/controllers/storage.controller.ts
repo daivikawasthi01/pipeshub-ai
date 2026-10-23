@@ -12,6 +12,7 @@ import {
   STORAGE_WRITE_FAILED_MESSAGE,
   MAX_SIGNED_URL_TTL_SECONDS,
   CONNECTOR_VRID_PAGE_DEFAULT,
+  ARTIFACT_URL_TTL_SECONDS,
 } from '../constants/constants';
 import {
   AzureBlobStorageConfig,
@@ -25,6 +26,7 @@ import { StorageServiceAdapter } from '../adapter/base-storage.adapter';
 import {
   BadRequestError,
   ConflictError,
+  ForbiddenError,
   InternalServerError,
   NotFoundError,
   ServiceUnavailableError,
@@ -33,6 +35,7 @@ import {
   Document,
   DocumentVersion,
   FilePayload,
+  SignedObjectUrl,
   StorageServiceResponse,
   StorageVendor,
 } from '../types/storage.service.types';
@@ -43,6 +46,7 @@ import {
   requestFingerprint,
 } from '../utils/idempotency';
 import {
+  getArtifactSetRoot,
   getCurrentFilePath,
   DocumentInfoResponse,
   LeanDocumentInfoResponse,
@@ -108,7 +112,18 @@ interface RelocateMove {
   recordGroupId?: string;
 }
 
+interface ArtifactFileRequest {
+  path: string;
+  contentType: string;
+}
+
+interface ArtifactFileUrl extends SignedObjectUrl {
+  path: string;
+  method: 'GET' | 'PUT';
+}
+
 const ENVELOPE_PREFIXES = ['record_', 'metadata_'];
+const MONGO_DUPLICATE_KEY = 11000;
 // Same shape the relocate and purge routes accept.
 const VIRTUAL_RECORD_ID = /^[A-Za-z0-9_-]{1,128}$/;
 
@@ -147,8 +162,9 @@ function tagOf(doc: ScopedDocument, key: string): unknown {
 }
 
 // A virtual record's `record_{id}` and `metadata_{id}` wherever they are filed,
-// plus anything at the flat `records/{id}` path older records used. orgId sits
-// in each branch so each one can use its own index.
+// anything at the flat `records/{id}` path older records used, and every
+// content revision stored for it. orgId sits in each branch so each one can
+// use its own index.
 function virtualRecordDocumentsFilter(
   orgIdText: string,
   orgId: mongoose.Types.ObjectId,
@@ -169,8 +185,21 @@ function virtualRecordDocumentsFilter(
           $in: ENVELOPE_PREFIXES.map((p) => `${p}${virtualRecordId}`),
         },
       },
+      { orgId, 'artifactSet.virtualRecordId': virtualRecordId },
     ],
   };
+}
+
+// Rebuilt from the revision's ids rather than read from the stored root, so a
+// damaged row can never point a tree delete anywhere else.
+function artifactSetRootOf(document: {
+  orgId: unknown;
+  artifactSet?: { virtualRecordId: string; rev: string };
+}): string | null {
+  const set = document.artifactSet;
+  return set
+    ? getArtifactSetRoot(String(document.orgId), set.virtualRecordId, set.rev)
+    : null;
 }
 
 function virtualRecordIdOf(
@@ -499,12 +528,14 @@ export class StorageController {
       }
 
       if (hard) {
-        const rootPath = getDocumentRootPath(
-          String(orgId),
-          String(document._id),
-          undefined,
-          document.documentPath,
-        );
+        const rootPath =
+          artifactSetRootOf(document) ??
+          getDocumentRootPath(
+            orgId,
+            String(document._id),
+            undefined,
+            document.documentPath,
+          );
         
         try {
           const adapter = await this.initializeStorageAdapter(req);
@@ -629,6 +660,23 @@ export class StorageController {
     }
     const adapter = await this.initializeStorageAdapter(req);
     for (const document of documents) {
+      const artifactRoot = artifactSetRootOf(document);
+      if (artifactRoot !== null) {
+        try {
+          await adapter.deleteTree(artifactRoot);
+        } catch (error) {
+          this.logger.error(
+            'Could not remove an artifact set; its document was kept',
+            {
+              documentId: String(document._id),
+              error: error instanceof Error ? error.message : String(error),
+            },
+          );
+          throw new ServiceUnavailableError(
+            'Could not remove the stored files; the document was kept so the removal can be retried',
+          );
+        }
+      }
       for (const copy of storedCopies(document)) {
         try {
           await adapter.deleteObject(copy);
@@ -647,6 +695,363 @@ export class StorageController {
       }
       await DocumentModel.deleteOne({ _id: document._id, orgId });
     }
+  }
+
+  /**
+   * Issues upload URLs for every file of one content revision in one call. The
+   * revision is one document, created on first use and found again on every
+   * later call, so a retried presign never makes a second one.
+   */
+  async presignArtifactSet(
+    req: AuthenticatedServiceRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> {
+    try {
+      const orgId = extractOrgId(req);
+      this.assertBodyOrgMatchesToken(req, orgId);
+      const { virtualRecordId, rev, files } = req.body as {
+        virtualRecordId: string;
+        rev: string;
+        files: ArtifactFileRequest[];
+      };
+      const storageType = await this.getConfiguredStorageType(req);
+      if (!isValidStorageVendor(storageType)) {
+        throw new BadRequestError(`Invalid storage type: ${storageType}`);
+      }
+      // Reached before the document is made, so a store that cannot be
+      // opened leaves nothing behind.
+      const adapter = await this.remoteArtifactAdapter(req, storageType);
+      const document = await this.findOrCreateArtifactSet(
+        req,
+        orgId,
+        virtualRecordId,
+        rev,
+        getStorageVendor(storageType),
+      );
+      const urls = await this.artifactFileUrls(
+        req,
+        adapter,
+        document,
+        files,
+        'PUT',
+      );
+      res.status(HTTP_STATUS.OK).json({
+        documentId: String(document._id),
+        virtualRecordId,
+        rev,
+        root: artifactSetRootOf(document),
+        expiresInSeconds: ARTIFACT_URL_TTL_SECONDS,
+        files: urls,
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  async getArtifactReadUrls(
+    req: AuthenticatedServiceRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> {
+    try {
+      const orgId = extractOrgId(req);
+      this.assertBodyOrgMatchesToken(req, orgId);
+      const document = await this.findArtifactSet(req, orgId);
+      const { paths } = req.body as { paths: string[] };
+      const storageType = await this.getConfiguredStorageType(req);
+      const adapter = await this.remoteArtifactAdapter(req, storageType);
+      const urls = await this.artifactFileUrls(
+        req,
+        adapter,
+        document,
+        paths.map((path) => ({ path })),
+        'GET',
+      );
+      res.status(HTTP_STATUS.OK).json({
+        documentId: String(document._id),
+        expiresInSeconds: ARTIFACT_URL_TTL_SECONDS,
+        files: urls,
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  /** Local storage's stand-in for a signed PUT. */
+  async putArtifactFile(
+    req: AuthenticatedServiceRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> {
+    try {
+      const orgId = extractOrgId(req);
+      const document = await this.findArtifactSet(req, orgId);
+      if (!Buffer.isBuffer(req.body)) {
+        throw new BadRequestError(
+          'Send the file as the request body with Content-Type application/octet-stream',
+        );
+      }
+      const adapter = await this.localArtifactAdapter(req);
+      const path = String(req.params[0]);
+      try {
+        await adapter.writeObject(
+          `${this.artifactRoot(document)}/${path}`,
+          req.body,
+        );
+      } catch (error) {
+        this.logger.error('Could not write an artifact file', {
+          documentId: String(document._id),
+          path,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        throw new ServiceUnavailableError(STORAGE_WRITE_FAILED_MESSAGE);
+      }
+      res.status(HTTP_STATUS.OK).json({ path, size: req.body.length });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  /** Local storage's stand-in for a signed GET; honours Range. */
+  async getArtifactFile(
+    req: AuthenticatedServiceRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> {
+    try {
+      const orgId = extractOrgId(req);
+      const document = await this.findArtifactSet(req, orgId);
+      const adapter = await this.localArtifactAdapter(req);
+      const fullPath = adapter.localObjectPath(
+        `${this.artifactRoot(document)}/${String(req.params[0])}`,
+      );
+      // The mount itself sits under a dot folder (~/.local), which send would
+      // otherwise answer as missing.
+      res.sendFile(fullPath, { dotfiles: 'allow' }, (error?: Error) => {
+        if (error === undefined || res.headersSent) {
+          return;
+        }
+        next(
+          (error as { code?: string }).code === 'ENOENT'
+            ? new NotFoundError('File not found')
+            : error,
+        );
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  /** Removes a revision's whole tree, then its document. Safe to repeat. */
+  async purgeArtifactSet(
+    req: AuthenticatedServiceRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> {
+    try {
+      const orgId = toObjectId(extractOrgId(req), 'organization');
+      const document = await DocumentModel.findOne({
+        _id: req.params.documentId,
+        orgId,
+        artifactSet: { $exists: true },
+      });
+      const documents = document ? [document] : [];
+      await this.purgeDocuments(documents, orgId, req);
+      res.status(HTTP_STATUS.OK).json({ purged: documents.length });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  async listArtifactSets(
+    req: AuthenticatedServiceRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> {
+    try {
+      const orgId = toObjectId(extractOrgId(req), 'organization');
+      const virtualRecordId = req.query.virtualRecordId as string;
+      const documents = await DocumentModel.find({
+        orgId,
+        'artifactSet.virtualRecordId': virtualRecordId,
+      })
+        .sort({ createdAt: 1 })
+        .select('_id artifactSet storageVendor createdAt updatedAt')
+        .lean<
+          {
+            _id: unknown;
+            artifactSet: { rev: string };
+            storageVendor: string;
+            createdAt?: number;
+            updatedAt?: number;
+          }[]
+        >();
+      res.status(HTTP_STATUS.OK).json({
+        revisions: documents.map((d) => ({
+          documentId: String(d._id),
+          virtualRecordId,
+          rev: d.artifactSet.rev,
+          storageVendor: d.storageVendor,
+          createdAt: d.createdAt,
+          updatedAt: d.updatedAt,
+        })),
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  // The org comes from the storage token alone. A body that names another org
+  // is refused before anything is created, rather than quietly ignored.
+  private assertBodyOrgMatchesToken(
+    req: AuthenticatedServiceRequest,
+    orgId: string,
+  ): void {
+    const claimed = (req.body as { orgId?: unknown } | undefined)?.orgId;
+    if (claimed !== undefined && claimed !== orgId) {
+      throw new ForbiddenError(
+        'The organization in the request does not match the storage token',
+      );
+    }
+  }
+
+  private artifactRoot(document: DocumentModel): string {
+    const root = artifactSetRootOf(document);
+    if (root === null) {
+      throw new NotFoundError('Artifact set not found');
+    }
+    return root;
+  }
+
+  private async findArtifactSet(
+    req: AuthenticatedServiceRequest,
+    orgId: string,
+  ): Promise<DocumentModel> {
+    const document = await DocumentModel.findOne({
+      _id: req.params.documentId,
+      orgId: toObjectId(orgId, 'organization'),
+      artifactSet: { $exists: true },
+    });
+    if (!document) {
+      throw new NotFoundError('Artifact set not found');
+    }
+    return document;
+  }
+
+  private async findOrCreateArtifactSet(
+    req: AuthenticatedServiceRequest,
+    orgId: string,
+    virtualRecordId: string,
+    rev: string,
+    storageVendor: StorageVendor,
+  ): Promise<DocumentModel> {
+    const orgObjectId = toObjectId(orgId, 'organization');
+    const userId = extractUserId(req);
+    const initiatorUserId = userId !== null ? toObjectId(userId, 'user') : null;
+    const filter = {
+      orgId: orgObjectId,
+      'artifactSet.virtualRecordId': virtualRecordId,
+      'artifactSet.rev': rev,
+    };
+    const existing = await DocumentModel.findOne(filter);
+    if (existing) {
+      return existing;
+    }
+    try {
+      return await DocumentModel.create({
+        documentName: `revision_${rev}`,
+        documentPath: getFullDocumentPath(orgId, `records/${virtualRecordId}`),
+        orgId: orgObjectId,
+        isVersionedFile: false,
+        initiatorUserId,
+        storageVendor,
+        extension: '',
+        artifactSet: {
+          virtualRecordId,
+          rev,
+          root: getArtifactSetRoot(orgId, virtualRecordId, rev),
+        },
+      });
+    } catch (error) {
+      // Another presign of the same revision created it first.
+      if ((error as { code?: unknown } | null)?.code !== MONGO_DUPLICATE_KEY) {
+        throw error;
+      }
+      const winner = await DocumentModel.findOne(filter);
+      if (!winner) {
+        throw error;
+      }
+      return winner;
+    }
+  }
+
+  private async remoteArtifactAdapter(
+    req: AuthenticatedServiceRequest,
+    storageType: string,
+  ): Promise<StorageServiceAdapter | null> {
+    return storageType === (StorageVendor.Local as string)
+      ? null
+      : this.initializeStorageAdapter(req);
+  }
+
+  /** `adapter` is null on local storage, whose files are served by this API. */
+  private async artifactFileUrls(
+    req: AuthenticatedServiceRequest,
+    adapter: StorageServiceAdapter | null,
+    document: DocumentModel,
+    files: { path: string; contentType?: string }[],
+    method: 'GET' | 'PUT',
+  ): Promise<ArtifactFileUrl[]> {
+    const root = this.artifactRoot(document);
+    if (adapter === null) {
+      const storageEndpoint = await storedServiceEndpoint(
+        this.keyValueStoreService,
+        'storage',
+        this.config.endpoint,
+      );
+      const base = `${storageEndpoint}/api/v1/document/internal/artifacts/${String(document._id)}/files`;
+      const headers: Record<string, string> = {
+        Authorization:
+          req.verifiedToken !== undefined
+            ? `Bearer ${req.verifiedToken}`
+            : (req.headers.authorization ?? ''),
+      };
+      if (method === 'PUT') {
+        // The API parses JSON bodies before any route sees them, so the file
+        // goes up as opaque bytes whatever it holds.
+        headers['Content-Type'] = 'application/octet-stream';
+      }
+      return files.map(({ path }) => ({
+        path,
+        method,
+        url: `${base}/${path}`,
+        headers: { ...headers },
+      }));
+    }
+    return Promise.all(
+      files.map(async ({ path, contentType }) => ({
+        path,
+        method,
+        ...(await adapter.signObjectUrl(`${root}/${path}`, {
+          method,
+          contentType,
+          expiresInSeconds: ARTIFACT_URL_TTL_SECONDS,
+        })),
+      })),
+    );
+  }
+
+  private async localArtifactAdapter(
+    req: AuthenticatedServiceRequest,
+  ): Promise<StorageServiceAdapter> {
+    const storageType = await this.getConfiguredStorageType(req);
+    if (storageType !== (StorageVendor.Local as string)) {
+      throw new BadRequestError(
+        'Artifact files are served by the API only on local storage; use the signed URLs',
+      );
+    }
+    return this.initializeStorageAdapter(req);
   }
 
   /**

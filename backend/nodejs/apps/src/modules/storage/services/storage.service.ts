@@ -1,4 +1,10 @@
-import { Document, FilePayload, StorageServiceResponse } from "../types/storage.service.types";
+import {
+  Document,
+  FilePayload,
+  SignObjectUrlOptions,
+  SignedObjectUrl,
+  StorageServiceResponse,
+} from '../types/storage.service.types';
 
 /**
  * Interface for a storage service to handle file operations in different storage systems.
@@ -180,4 +186,24 @@ export interface StorageServiceInterface {
    * @param storageKey - The storage key / relative path of the object.
    */
   getObjectUrl?(storageKey: string): string;
+
+  /**
+   * Signs a URL for reading or writing one object by its storage key. Only the
+   * remote vendors implement it; local storage is served through the API.
+   */
+  signObjectUrl?(
+    storageKey: string,
+    options: SignObjectUrlOptions,
+  ): Promise<SignedObjectUrl>;
+
+  /**
+   * Writes bytes at a storage key, replacing any file already there. Local only.
+   */
+  writeObject?(storageKey: string, data: Buffer): Promise<void>;
+
+  /**
+   * The absolute filesystem path of a storage key, checked to be inside the
+   * mount. Local only.
+   */
+  localObjectPath?(storageKey: string): string;
 }

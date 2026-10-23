@@ -2,6 +2,8 @@ import { StorageServiceInterface } from '../services/storage.service';
 import {
   Document,
   FilePayload,
+  SignObjectUrlOptions,
+  SignedObjectUrl,
   StorageServiceResponse,
 } from '../types/storage.service.types';
 
@@ -223,5 +225,33 @@ export class StorageServiceAdapter {
       throw new Error('getObjectUrl not implemented for this storage provider');
     }
     return this.adapter.getObjectUrl(storageKey);
+  }
+
+  signObjectUrl(
+    storageKey: string,
+    options: SignObjectUrlOptions,
+  ): Promise<SignedObjectUrl> {
+    return this.adapter.signObjectUrl
+      ? this.adapter.signObjectUrl(storageKey, options)
+      : Promise.reject(
+          new Error('signObjectUrl not implemented for this storage provider'),
+        );
+  }
+
+  writeObject(storageKey: string, data: Buffer): Promise<void> {
+    return this.adapter.writeObject
+      ? this.adapter.writeObject(storageKey, data)
+      : Promise.reject(
+          new Error('writeObject not implemented for this storage provider'),
+        );
+  }
+
+  localObjectPath(storageKey: string): string {
+    if (!this.adapter.localObjectPath) {
+      throw new Error(
+        'localObjectPath not implemented for this storage provider',
+      );
+    }
+    return this.adapter.localObjectPath(storageKey);
   }
 }

@@ -463,6 +463,25 @@ class LocalStorageAdapter implements StorageServiceInterface {
     }
   }
 
+  async writeObject(storageKey: string, data: Buffer): Promise<void> {
+    try {
+      const fullPath = this.localObjectPath(storageKey);
+      await fs.mkdir(path.dirname(fullPath), { recursive: true });
+      await this.writeFileAtomically(fullPath, data);
+    } catch (error) {
+      if (error instanceof StorageError) throw error;
+      throw new StorageUploadError('Failed to write object to local storage', {
+        originalError: error instanceof Error ? error.message : 'Unknown error',
+      });
+    }
+  }
+
+  localObjectPath(storageKey: string): string {
+    return this.assertInsideMount(
+      path.join(this.mountPath, this.sanitizePath(storageKey)),
+    );
+  }
+
   async deleteTree(storagePath: string): Promise<StorageServiceResponse<void>> {
     try {
       const relativePath = this.sanitizePath(storagePath);

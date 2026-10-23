@@ -244,6 +244,18 @@ export function getFullDocumentPath(
 }
 
 /**
+ * Where one content revision of a virtual record keeps its files.
+ * e.g. 'org1/PipesHub/records/vr-1/0123abcd'
+ */
+export function getArtifactSetRoot(
+  orgId: string,
+  virtualRecordId: string,
+  rev: string,
+): string {
+  return `${getFullDocumentPath(orgId, `records/${virtualRecordId}`)}/${rev}`;
+}
+
+/**
  * Returns the versioned snapshot path for a specific version number.
  * e.g. 'org1/PipesHub/Finance/doc1/versions/v3.pdf'
  */
