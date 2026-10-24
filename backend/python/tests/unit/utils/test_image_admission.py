@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import io
+import re
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
@@ -22,6 +23,7 @@ from app.utils.image_admission import (
     ImageCandidate,
     ImageOrigin,
     admission_from_state,
+    content_hash,
 )
 from app.utils.image_policy import permissive_policy, resolve_image_policy
 
@@ -73,6 +75,29 @@ def _candidate(
 
 def _admission(max_images: int = 10, budget: ImageBudget | None = None) -> ImageAdmission:
     return ImageAdmission(permissive_policy(max_images), budget=budget)
+
+
+class TestContentHash:
+
+    def test_matches_the_pinned_vector_for_abc(self) -> None:
+        assert content_hash("abc") == "ba7816bf8f01cfea"
+
+    def test_matches_the_pinned_vector_for_the_empty_string(self) -> None:
+        assert content_hash("") == "e3b0c44298fc1c14"
+
+    def test_a_lone_surrogate_is_dropped_and_does_not_change_the_hash(self) -> None:
+        assert content_hash("\ud800abc") == content_hash("abc")
+
+    def test_the_mime_prefix_is_part_of_the_identity(self) -> None:
+        png = content_hash("data:image/png;base64,QQ==")
+        jpeg = content_hash("data:image/jpeg;base64,QQ==")
+        assert png != jpeg
+        assert re.fullmatch(r"[0-9a-f]{16}", png)
+        assert re.fullmatch(r"[0-9a-f]{16}", jpeg)
+
+    def test_is_deterministic_across_calls(self) -> None:
+        uri = "data:image/png;base64,QQ=="
+        assert content_hash(uri) == content_hash(uri)
 
 
 class TestNothingVanishes:
